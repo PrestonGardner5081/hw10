@@ -96,7 +96,7 @@ struct calibration_data calibration_gyroscope;
 struct calibration_data calibration_magnetometer;
 struct raspicam_wrapper_handle *Camera;
 
-pthread_mutex_t alarmLock, inputLock, dataCollectLock, leftControlLock, rightControlLock, scheduleLock, pwmLock, printLock, takePicLock, fileWriteLock, writeCountsLock, newPicLock; // FIXME PRINTLOCK
+pthread_mutex_t alarmLock1, alarmLock2, inputLock, dataCollectLock, leftControlLock, rightControlLock, scheduleLock, pwmLock, printLock, takePicLock, fileWriteLock, writeCountsLock, newPicLock; // FIXME PRINTLOCK
 pthread_cond_t willTakePic = PTHREAD_COND_INITIALIZER;
 pthread_cond_t willCollectData = PTHREAD_COND_INITIALIZER;
 pthread_cond_t dataCond = PTHREAD_COND_INITIALIZER;
@@ -397,17 +397,16 @@ void alarmHandler()
 
 void *getTimedPic()
 {
-
     while (1)
     {
         if (state.end)
             break;
 
-        pthread_mutex_lock(&alarmLock);
-        pthread_cond_wait(&dataCond, &alarmLock);
-        pthread_mutex_unlock(&alarmLock);
+        pthread_mutex_lock(&alarmLock1);
+        pthread_cond_wait(&dataCond, &alarmLock1);
+        pthread_mutex_unlock(&alarmLock1);
 
-        if (state.alarmCounter > 10)
+        if (state.alarmCounter > 3) // ensures there is a new pic roughly every 100ms
         {
             raspicam_wrapper_grab(Camera);
 
@@ -428,9 +427,9 @@ void *getTimedData()
         if (state.end)
             break;
 
-        pthread_mutex_lock(&alarmLock);
-        pthread_cond_wait(&dataCond, &alarmLock);
-        pthread_mutex_unlock(&alarmLock);
+        pthread_mutex_lock(&alarmLock2);
+        pthread_cond_wait(&dataCond, &alarmLock2);
+        pthread_mutex_unlock(&alarmLock2);
 
         read_accelerometer_gyroscope(&calibration_accelerometer, &calibration_gyroscope, &state.sd, io->bsc);
         state.readCounts += 1;
@@ -1689,7 +1688,8 @@ int main(void)
         pthread_mutex_init(&writeCountsLock, NULL);
         pthread_mutex_init(&dataCollectLock, NULL);
         pthread_mutex_init(&newPicLock, NULL);
-        pthread_mutex_init(&alarmLock, NULL);
+        pthread_mutex_init(&alarmLock1, NULL);
+        pthread_mutex_init(&alarmLock2, NULL);
 
         pthread_t inputThread, scheduleThread, leftThread, rightThread, dataCThread, dataAThread, procPicThread, timedDataThread, timedPicThread;
         pthread_create(&inputThread, &pAttr, &checkInput, NULL);       // create thread for input polling
@@ -1723,7 +1723,8 @@ int main(void)
         pthread_mutex_destroy(&writeCountsLock);
         pthread_mutex_destroy(&newPicLock);
         pthread_mutex_destroy(&dataCollectLock);
-        pthread_mutex_destroy(&alarmLock);
+        pthread_mutex_destroy(&alarmLock1);
+        pthread_mutex_destroy(&alarmLock2);
 
         cleanQuit(); // turn off all lights and quit
     }
