@@ -1,40 +1,40 @@
 /**************************************************
-* CMPEN 473, Spring 2022, Penn State University
-* 
-* Homework 9
-* On 04/10/2022
-* By Preston Gardner
-* 
-***************************************************/
+ * CMPEN 473, Spring 2022, Penn State University
+ *
+ * Homework 9
+ * On 04/20/2022
+ * By Preston Gardner
+ *
+ ***************************************************/
 
-/* Homework 9 
- * User input from terminal controls robot: 
+/* Homework 9
+ * User input from terminal controls robot:
  * In either mode:
  *      (1) Print IMU data: 'p'
  *      (2) Display distance and average speed: 'n'
  *      (3) Print map of car movement since last recording: 't'
- *      (4) 
- * 
+ *      (4)
+ *
  * mode 'm1':
  *      (1) Stop: ' s '
- *      (2) Forward: ' w ' 
+ *      (2) Forward: ' w '
  *      (3) Backward: ' x '
  *      (4) Faster: ' i ' 5% PWM power increase for each ‘i’ key hit
  *      (5) Slower: ' j ' 5% PWM power decrease for each ‘j’ key hit
  *      (6) Left: ' a ' 15 degree turn for each ‘a’ key hit, smooth transition
  *      (7) Right: ' d ' 15 degree turn for each ‘d’ key hit, smooth transition
  *      (8) Quit: ' q ' to quit all program proper (without cnt’l c, and without an Enter key)
- * 
+ *
  * mode 'm2':
  *      Car follows laser pointer autonomously. Press 'w' to start or 'm1' to switch back to manual driving mode
- * 
+ *
  * Raspberry Pi 3 computer with
- * Motor driver controlled by  
+ * Motor driver controlled by
  * PWM on GPIO12 -> PWMA (left motors) and GPIO13 -> PWMB (right motors)
- * GPIO05 -> AI1, GPIO06 -> AI2 (left motor direction control) 
- * GPIO22 -> BI1, GPIO23 -> BI2 (right motor direction control) 
- * 
- * IMPORTANT! This project is made for the raspberry pi 3. The base memory 
+ * GPIO05 -> AI1, GPIO06 -> AI2 (left motor direction control)
+ * GPIO22 -> BI1, GPIO23 -> BI2 (right motor direction control)
+ *
+ * IMPORTANT! This project is made for the raspberry pi 3. The base memory
  * address in io_peripherals.c needs to be 0x3F000000 to run on rasp pi 3
  */
 #include <stdio.h>
@@ -73,14 +73,14 @@ const int PWM_50_PERC = PWM_MIN + PWM_RANGE / 2;
 const int PWM_5_PERC = PWM_RANGE / 20;
 const int RIGHT_MAX = 926;
 const int TURN_LOW = PWM_MIN + 2 * PWM_5_PERC;
-const int RAMP_TIME = 15; //us interval to ramp up / down speed
+const int RAMP_TIME = 15; // us interval to ramp up / down speed
 const int INSTR_QUEUE_SIZE = 1024;
 const int DATA_QUEUE_SIZE = 10000; // about 1.67 minutes of data
 const long TURN_TIME = 300000;
 const long Z_C_TURN_TIME = TURN_TIME / 2;
 const long CHECK_IR_INT = TURN_TIME / 100;
-const long THREAD_PROCESS_TIME_uS = 10000;      //10000 uS = 10 ms
-const long THREAD_PIC_PROCESS_TIME_uS = 100000; //100000 uS = 100 ms
+const long THREAD_PROCESS_TIME_uS = 10000;      // 10000 uS = 10 ms
+const long THREAD_PIC_PROCESS_TIME_uS = 100000; // 100000 uS = 100 ms
 const long CLOCKS_PER_MILLI = CLOCKS_PER_SEC / 1000;
 const long CLOCKS_PER_MIRCO = CLOCKS_PER_MILLI / 1000;
 const float ACC_PRECISION = 0.001;
@@ -96,30 +96,32 @@ struct calibration_data calibration_gyroscope;
 struct calibration_data calibration_magnetometer;
 struct raspicam_wrapper_handle *Camera;
 
-pthread_mutex_t inputLock, leftControlLock, rightControlLock, scheduleLock, pwmLock, printLock, takePicLock, fileWriteLock, writeCountsLock, newPicLock; //FIXME PRINTLOCK
+pthread_mutex_t alarmLock, inputLock, dataCollectLock, leftControlLock, rightControlLock, scheduleLock, pwmLock, printLock, takePicLock, fileWriteLock, writeCountsLock, newPicLock; // FIXME PRINTLOCK
 pthread_cond_t willTakePic = PTHREAD_COND_INITIALIZER;
+pthread_cond_t willCollectData = PTHREAD_COND_INITIALIZER;
+pthread_cond_t dataCond = PTHREAD_COND_INITIALIZER;
 
 struct publicState
 {
     bool end;
+    bool stopPics;
     bool stopCollection;
     char rightDirection;
     char leftDirection;
-    int left_lvl;
-    int right_lvl;
+    int16_t left_lvl;
+    int16_t right_lvl;
     struct queue leftQueue;
     struct queue rightQueue;
     struct queue inputQueue;
     struct spatial_data sd;
-    int readCounts;
-    int mode; // 0 = m0, 1 = m1, 2 = m2
-    int z_count;
-    int c_count;
-    bool newPic;   //is there a new pic to process?
-    bool printPic; //should we print pic?
+    sig_atomic_t readCounts;
+    uint8_t mode;        // 0 = m0, 1 = m1, 2 = m2
+    sig_atomic_t newPic; // is there a new pic to process?
+    bool printPic;       // should we print pic?
     unsigned char image[IMG_RED_WIDTH][IMG_RED_HEIGHT];
-    int xDist;
-    int yDist;
+    uint16_t xDist;
+    uint16_t yDist;
+    uint8_t alarmCounter;
 } state;
 
 struct dataQueue
@@ -185,15 +187,15 @@ void clearDataQueues(struct dataQueue *dq)
     clearFQueue(&(dq->GYRO_Z));
     clearFQueue(&(dq->TIME));
 }
-//set all inputs to outputs to turn off lights on quit
+// set all inputs to outputs to turn off lights on quit
 void cleanQuit()
 {
-    io->gpio->GPFSEL1.field.FSEL2 = GPFSEL_INPUT; //GPIO12
-    io->gpio->GPFSEL1.field.FSEL3 = GPFSEL_INPUT; //GPIO13
-    io->gpio->GPFSEL0.field.FSEL5 = GPFSEL_INPUT; //GPIO05
-    io->gpio->GPFSEL0.field.FSEL6 = GPFSEL_INPUT; //GPIO06
-    io->gpio->GPFSEL2.field.FSEL2 = GPFSEL_INPUT; //GPIO22
-    io->gpio->GPFSEL2.field.FSEL3 = GPFSEL_INPUT; //GPIO23
+    io->gpio->GPFSEL1.field.FSEL2 = GPFSEL_INPUT; // GPIO12
+    io->gpio->GPFSEL1.field.FSEL3 = GPFSEL_INPUT; // GPIO13
+    io->gpio->GPFSEL0.field.FSEL5 = GPFSEL_INPUT; // GPIO05
+    io->gpio->GPFSEL0.field.FSEL6 = GPFSEL_INPUT; // GPIO06
+    io->gpio->GPFSEL2.field.FSEL2 = GPFSEL_INPUT; // GPIO22
+    io->gpio->GPFSEL2.field.FSEL3 = GPFSEL_INPUT; // GPIO23
     raspicam_wrapper_destroy(Camera);
 }
 
@@ -221,7 +223,7 @@ int setSpdLeft(int spd)
         while (state.left_lvl < spd)
         {
             state.left_lvl += PWM_5_PERC;
-            io->pwm->DAT1 = state.left_lvl; //PWMA right
+            io->pwm->DAT1 = state.left_lvl; // PWMA right
             usleep(RAMP_TIME);
             time_taken += RAMP_TIME;
         }
@@ -236,7 +238,7 @@ int setSpdLeft(int spd)
             state.left_lvl -= PWM_5_PERC;
             if (state.left_lvl < 0)
                 state.left_lvl = 0;
-            io->pwm->DAT1 = state.left_lvl; //PWMA right
+            io->pwm->DAT1 = state.left_lvl; // PWMA right
             usleep(RAMP_TIME);
             time_taken += RAMP_TIME;
         }
@@ -263,7 +265,7 @@ int setSpdRight(int spd)
         while (state.right_lvl < spd)
         {
             state.right_lvl += PWM_5_PERC;
-            io->pwm->DAT2 = leftLookup[state.right_lvl]; //PWMA left
+            io->pwm->DAT2 = leftLookup[state.right_lvl]; // PWMA left
             usleep(RAMP_TIME);
             time_taken += RAMP_TIME;
         }
@@ -280,7 +282,7 @@ int setSpdRight(int spd)
             if (state.right_lvl < 0)
                 state.right_lvl = 0;
 
-            io->pwm->DAT2 = leftLookup[state.right_lvl]; //PWMA left
+            io->pwm->DAT2 = leftLookup[state.right_lvl]; // PWMA left
             usleep(RAMP_TIME);
             time_taken += RAMP_TIME;
         }
@@ -289,24 +291,43 @@ int setSpdRight(int spd)
     return time_taken;
 }
 
-void getAccData(int sig_num)
+void alarmHandler()
 {
-    read_accelerometer_gyroscope(&calibration_accelerometer, &calibration_gyroscope, &state.sd, io->bsc);
-    pthread_mutex_lock(&writeCountsLock);
-    state.readCounts += 1;
-    pthread_mutex_unlock(&writeCountsLock);
+    if (!state.stopCollection)
+        pthread_cond_broadcast(&dataCond);
 }
 
-void takePic()
+void *getTimedData()
 {
-    raspicam_wrapper_grab(Camera);
+    while (1)
+    {
+        if (state.end)
+            break;
 
-    pthread_mutex_lock(&newPicLock);
-    state.newPic = true;
-    pthread_mutex_unlock(&newPicLock);
+        pthread_mutex_lock(&alarmLock);
+        pthread_cond_wait(&dataCond, &alarmLock);
+        pthread_mutex_unlock(&alarmLock);
+
+        if (state.end)
+            break;
+
+        read_accelerometer_gyroscope(&calibration_accelerometer, &calibration_gyroscope, &state.sd, io->bsc);
+        state.readCounts += 1;
+
+        if (state.alarmCounter > 10)
+        {
+            raspicam_wrapper_grab(Camera);
+            state.newPic = 1;
+            state.alarmCounter = 0;
+        }
+        else
+            state.alarmCounter++;
+    }
+
+    pthread_exit(0);
 }
 
-void dataToPPM(unsigned char *data, char *name, int width, int height, int size) //for testing
+void dataToPPM(unsigned char *data, char *name, int width, int height, int size) // for testing
 {
     FILE *outFile = fopen(name, "wb");
     if (outFile != NULL)
@@ -358,7 +379,7 @@ unsigned char avgArr(int wStart, int hStart, int scale, int width, int height, u
 
 int *threshold(int width, int height) // classify each pixel as over or under threshold and find center mass of laser
 {
-    int threshold = 230; //90% threshold
+    int threshold = 230; // 90% threshold
     int xAvg = 0;
     int xCount = 0;
     int yAvg = 0;
@@ -435,7 +456,7 @@ void sendToArray(unsigned char *data, int width, int height, bool print)
     threshold(IMG_RED_WIDTH, IMG_RED_HEIGHT);
 
     if (print)
-        arrToPPM("testarr.ppm", IMG_RED_WIDTH, IMG_RED_HEIGHT, state.image); //FIXME
+        arrToPPM("testarr.ppm", IMG_RED_WIDTH, IMG_RED_HEIGHT, state.image); // FIXME
 }
 
 void makeRedScale(unsigned char *data, unsigned int pixel_count)
@@ -467,41 +488,149 @@ void processPic(bool printFull, bool printThresh)
     sendToArray(data, pixWidth, pixHeight, printThresh);
 
     if (printFull)
-        dataToPPM(data, "test1.ppm", pixWidth, pixHeight, image_size); //FIXME
+        dataToPPM(data, "test1.ppm", pixWidth, pixHeight, image_size); // FIXME
 
     free(data);
 }
 
+void *dataAnalyze()
+{
+    printf("dataAnalyze ID= %d\n", pthread_self()); // get current thread id FIXME
+
+    pthread_mutex_lock(&dataCollectLock);
+    pthread_cond_wait(&willCollectData, &dataCollectLock);
+    pthread_mutex_unlock(&dataCollectLock);
+
+    float AX, AY, AZ, GX, GY, GZ, RT;
+    float maxAX = 0, maxAY = 0, maxAZ = 0, minAX = 0, minAY = 0, minAZ = 0, maxGX = 0, maxGY = 0, maxGZ = 0, minGX = 0, minGY = 0, minGZ = 0;
+
+    pthread_mutex_lock(&fileWriteLock);
+    char filename[] = "./hw7m1data.txt";
+    sprintf(filename, "./hw7m%ddata.txt", state.mode);
+    FILE *fp = fopen(filename, "w+");
+
+    while (true)
+    {
+        if (state.end)
+        {
+            if (maxAX != 0 && minAY != 0)
+                fprintf(fp, "EXTR\n%f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f", maxAX, maxAY, maxAZ, minAX, minAY, minAZ, maxGX, maxGY, maxGZ, minGX, minGY, minGZ);
+            fclose(fp);
+            pthread_mutex_unlock(&fileWriteLock);
+
+            break;
+        }
+        if (dQueues.ACCEL_X.size == 0)
+        {
+            if (state.stopCollection)
+            {
+                if (maxAX != 0 && minAY != 0)
+                    fprintf(fp, "EXTR\n%f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f", maxAX, maxAY, maxAZ, minAX, minAY, minAZ, maxGX, maxGY, maxGZ, minGX, minGY, minGZ);
+                fclose(fp);
+
+                pthread_mutex_unlock(&fileWriteLock);
+
+                pthread_mutex_lock(&dataCollectLock);
+                pthread_cond_wait(&willCollectData, &dataCollectLock);
+                pthread_mutex_unlock(&dataCollectLock);
+
+                if (state.end)
+                    break;
+
+                maxAX = 0, maxAY = 0, maxAZ = 0, minAX = 0, minAY = 0, minAZ = 0, maxGX = 0, maxGY = 0, maxGZ = 0, minGX = 0, minGY = 0, minGZ = 0;
+
+                xVelocity = 0, yVelocity = 0; // m/s
+                xPos = 0, yPos = 0;           // m
+                heading = 0;
+
+                sprintf(filename, "./hw7m%ddata.txt", state.mode);
+                pthread_mutex_lock(&fileWriteLock);
+                fp = fopen(filename, "w+");
+            }
+            else
+                usleep(8);
+        }
+        else
+        {
+            AX = fQueuePop(&(dQueues.ACCEL_X));
+            AY = fQueuePop(&(dQueues.ACCEL_Y));
+            AZ = fQueuePop(&(dQueues.ACCEL_Z));
+            GX = fQueuePop(&(dQueues.GYRO_X));
+            GY = fQueuePop(&(dQueues.GYRO_Y));
+            GZ = fQueuePop(&(dQueues.GYRO_Z));
+            RT = fQueuePop(&(dQueues.TIME)) / CLOCKS_PER_SEC;
+
+            maxAX = AX > maxAX ? AX : maxAX;
+            maxAY = AY > maxAY ? AY : maxAY;
+            maxAZ = AZ > maxAZ ? AZ : maxAZ;
+            maxGX = GX > maxGX ? GX : maxGX;
+            maxGY = GY > maxGY ? GY : maxGY;
+            maxGZ = GZ > maxGZ ? GZ : maxGZ;
+            maxAX = AX > maxAX ? AX : maxAX;
+            maxAY = AY > maxAY ? AY : maxAY;
+            maxAZ = AZ > maxAZ ? AZ : maxAZ;
+            maxGX = GX > maxGX ? GX : maxGX;
+            maxGY = GY > maxGY ? GY : maxGY;
+            maxGZ = GZ > maxGZ ? GZ : maxGZ;
+            minAX = AX < minAX ? AX : minAX;
+            minAY = AY < minAY ? AY : minAY;
+            minAZ = AZ < minAZ ? AZ : minAZ;
+            minGX = GX < minGX ? GX : minGX;
+            minGY = GY < minGY ? GY : minGY;
+            minGZ = GZ < minGZ ? GZ : minGZ;
+            minAX = AX < minAX ? AX : minAX;
+            minAY = AY < minAY ? AY : minAY;
+            minAZ = AZ < minAZ ? AZ : minAZ;
+            minGX = GX < minGX ? GX : minGX;
+            minGY = GY < minGY ? GY : minGY;
+            minGZ = GZ < minGZ ? GZ : minGZ;
+
+            heading = (heading + ((int)(GZ * 10) / 10) * RT);
+            // if (GZ > 1)
+            // printf("head: %d", ((int)GZ));
+
+            AY = (((int)(AY * 10)) / 10.0);
+
+            yVelocity += RT * (AY * cos(heading / 180 * PI) + AX * sin(heading / 180 * PI));
+            yPos += RT * yVelocity;
+
+            AX = (((int)(AX * 1)) / 1.0);
+
+            xVelocity += RT * (AX * cos(heading / 180 * PI) + AY * sin(heading / 180 * PI));
+            xPos += RT * xVelocity;
+
+            fprintf(fp, "%f, %f, %f, %f, %f, %f \n", AX, AY, AZ, GX, GY, GZ);
+        }
+    }
+    pthread_exit(0);
+}
+
 void *procPic()
 {
+    printf("procPic ID= %d\n", pthread_self()); // get current thread id FIXME
+
     long remainingTime = 0, startLoop = 0, stopLoop = 0;
     pthread_mutex_lock(&takePicLock);
     pthread_cond_wait(&willTakePic, &takePicLock);
     pthread_mutex_unlock(&takePicLock);
-
-    ualarm(THREAD_PIC_PROCESS_TIME_uS, THREAD_PIC_PROCESS_TIME_uS); //set alarm
 
     while (true)
     {
         startLoop = clock() / CLOCKS_PER_MIRCO;
         if (state.end)
         {
-            ualarm(0, 0); //reset alarm
             break;
         }
-        if (state.stopCollection)
-        {                 //stop collection if s is hit
-            ualarm(0, 0); //reset alarm
+        if (state.stopPics)
+        { // stop collection if s is hit
             pthread_mutex_lock(&takePicLock);
             pthread_cond_wait(&willTakePic, &takePicLock);
             pthread_mutex_unlock(&takePicLock);
-
-            ualarm(THREAD_PIC_PROCESS_TIME_uS, THREAD_PIC_PROCESS_TIME_uS); //set alarm
         }
 
         if (state.newPic)
         {
-            state.newPic = false;
+            state.newPic = 0;
 
             pthread_mutex_lock(&printLock);
             bool print = state.printPic;
@@ -514,20 +643,22 @@ void *procPic()
         stopLoop = clock() / CLOCKS_PER_MIRCO;
         remainingTime = THREAD_PIC_PROCESS_TIME_uS - stopLoop + startLoop;
         if (remainingTime > 0)
-            usleep(remainingTime); //sleep for remaining portion of 100ms
+            usleep(remainingTime); // sleep for remaining portion of 100ms
     }
     pthread_exit(0);
 }
 
 void *dataCollect()
 {
+
+    printf("dataCollect ID= %d\n", pthread_self()); // get current thread id FIXME
     long remainingTime = 0, startLoop = 0, stopLoop = 0;
 
-    pthread_mutex_lock(&takePicLock);
-    pthread_cond_wait(&willTakePic, &takePicLock);
-    pthread_mutex_unlock(&takePicLock);
+    pthread_mutex_lock(&dataCollectLock);
+    pthread_cond_wait(&willCollectData, &dataCollectLock);
+    pthread_mutex_unlock(&dataCollectLock);
 
-    ualarm(THREAD_PROCESS_TIME_uS, THREAD_PROCESS_TIME_uS); //set alarm
+    ualarm(THREAD_PROCESS_TIME_uS, THREAD_PROCESS_TIME_uS); // set alarm
     state.readCounts = 0;
 
     while (true)
@@ -535,24 +666,30 @@ void *dataCollect()
         startLoop = clock() / CLOCKS_PER_MIRCO;
         if (state.end)
         {
-            ualarm(0, 0); //reset alarm
+            ualarm(0, 0); // reset alarm
+            pthread_cond_broadcast(&dataCond);
             break;
         }
         if (state.stopCollection)
-        {                 //stop collection if s is hit
-            ualarm(0, 0); //reset alarm
-            pthread_mutex_lock(&takePicLock);
-            pthread_cond_wait(&willTakePic, &takePicLock);
-            pthread_mutex_unlock(&takePicLock);
+        {                 // stop collection if s is hit
+            ualarm(0, 0); // reset alarm
+            pthread_mutex_lock(&dataCollectLock);
+            pthread_cond_wait(&willCollectData, &dataCollectLock);
+            pthread_mutex_unlock(&dataCollectLock);
+
+            if (state.end)
+            {
+                pthread_cond_broadcast(&dataCond);
+                break;
+            }
+
             state.readCounts = 0;
-            ualarm(THREAD_PROCESS_TIME_uS, THREAD_PROCESS_TIME_uS); //set alarm
+            ualarm(THREAD_PROCESS_TIME_uS, THREAD_PROCESS_TIME_uS); // set alarm
         }
 
         fQueuePush(THREAD_PROCESS_TIME_uS * state.readCounts, &(dQueues.TIME));
 
-        pthread_mutex_lock(&writeCountsLock);
         state.readCounts = 0;
-        pthread_mutex_unlock(&writeCountsLock);
 
         fQueuePush((state.sd.ACCEL_XOUT.signed_value * calibration_accelerometer.scale - calibration_accelerometer.offset_x) * 9.81, &(dQueues.ACCEL_X));
         fQueuePush((state.sd.ACCEL_YOUT.signed_value * calibration_accelerometer.scale - calibration_accelerometer.offset_y) * 9.81, &(dQueues.ACCEL_Y));
@@ -565,13 +702,15 @@ void *dataCollect()
         stopLoop = clock() / CLOCKS_PER_MIRCO;
         remainingTime = THREAD_PROCESS_TIME_uS - stopLoop + startLoop;
         if (remainingTime > 0)
-            usleep(remainingTime); //sleep for remaining portion of 10ms
+            usleep(remainingTime); // sleep for remaining portion of 10ms
     }
     pthread_exit(0);
 }
 
 void *scheduler()
 {
+    printf("scheduler ID= %d\n", pthread_self()); // get current thread id FIXME
+
     long remainingTime, startLoop, stopLoop, startTurn, stopTurn, m0TimerStart, m0TimerStop = 0;
     uint32_t irRightVal;
     uint32_t irLeftVal;
@@ -583,6 +722,8 @@ void *scheduler()
         if (state.end)
         {
             pthread_cond_broadcast(&willTakePic);
+            pthread_cond_broadcast(&willCollectData);
+            pthread_cond_broadcast(&dataCond);
             break;
         }
 
@@ -592,6 +733,7 @@ void *scheduler()
         if (state.mode == 0 && m0TimerStop - m0TimerStart > 5000000)
         {
             state.mode = 1;
+            state.stopPics = true;
             state.stopCollection = true;
         }
         else if ((command = queuePop(&state.inputQueue)) != '\0')
@@ -601,26 +743,7 @@ void *scheduler()
                 while ((command = queuePop(&state.inputQueue)) == '\0')
                     ;
 
-                if (command == '0')
-                {
-                    // calibrate_accelerometer_and_gyroscope(&calibration_accelerometer, &calibration_gyroscope, io->bsc);
-                    m2IsDriving = false;
-                    state.mode = 0;
-                    state.stopCollection = false;
-
-                    pthread_mutex_lock(&rightControlLock);
-                    clearQueue(&state.rightQueue);
-                    queuePush('s', &state.rightQueue);
-                    pthread_mutex_unlock(&rightControlLock);
-                    pthread_mutex_lock(&leftControlLock);
-                    clearQueue(&state.leftQueue);
-                    queuePush('s', &state.leftQueue);
-                    pthread_mutex_unlock(&leftControlLock);
-
-                    pthread_cond_broadcast(&willTakePic);
-                    m0TimerStart = clock() / CLOCKS_PER_MIRCO;
-                }
-                else if (command == '1')
+                if (command == '1')
                 {
                     // calibrate_accelerometer_and_gyroscope(&calibration_accelerometer, &calibration_gyroscope, io->bsc);
                     m2IsDriving = false;
@@ -651,9 +774,9 @@ void *scheduler()
                     queuePush('s', &state.leftQueue);
                     pthread_mutex_unlock(&leftControlLock);
 
-                    GPIO_SET(io->gpio, 5); //set to forward
+                    GPIO_SET(io->gpio, 5); // set to forward
                     GPIO_CLR(io->gpio, 6);
-                    GPIO_SET(io->gpio, 22); //set to forward
+                    GPIO_SET(io->gpio, 22); // set to forward
                     GPIO_CLR(io->gpio, 23);
                 }
                 else
@@ -681,7 +804,7 @@ void *scheduler()
                 else if (command == 'w' && state.leftDirection != 'w' && state.rightDirection != 'w')
                 {
                     state.stopCollection = false;
-                    // pthread_cond_broadcast(&willTakePic);
+                    pthread_cond_broadcast(&willCollectData);
                 }
 
                 pthread_mutex_lock(&leftControlLock);
@@ -700,7 +823,9 @@ void *scheduler()
             {
                 m2IsDriving = false;
                 state.stopCollection = true;
+                state.stopPics = true;
                 state.mode = 2;
+
                 pthread_mutex_lock(&rightControlLock);
                 clearQueue(&state.rightQueue);
                 queuePush('s', &state.rightQueue);
@@ -717,23 +842,25 @@ void *scheduler()
                 pthread_mutex_unlock(&printLock);
             }
             else if (command == 'w' || m2IsDriving)
-            { //FIXME
+            { // FIXME
                 m2IsDriving = true;
                 state.stopCollection = false;
+                state.stopPics = false;
                 pthread_cond_broadcast(&willTakePic);
+                pthread_cond_broadcast(&willCollectData);
 
                 int rSpd;
                 int lSpd;
-                float xPerc = (float)abs(state.xDist) / ((float)IMG_RED_WIDTH / 2.0); //percentage of half img
+                float xPerc = (float)abs(state.xDist) / ((float)IMG_RED_WIDTH / 2.0); // percentage of half img
                 float yPerc = (float)abs(state.yDist) / ((float)IMG_RED_HEIGHT / 2.0);
 
                 if (state.yDist >= (IMG_RED_HEIGHT / 10))
                 {
                     io->pwm->DAT1 = 0;
                     io->pwm->DAT2 = 0;
-                    GPIO_SET(io->gpio, 5); //set to forward
+                    GPIO_SET(io->gpio, 5); // set to forward
                     GPIO_CLR(io->gpio, 6);
-                    GPIO_SET(io->gpio, 22); //set to forward
+                    GPIO_SET(io->gpio, 22); // set to forward
                     GPIO_CLR(io->gpio, 23);
 
                     rSpd = (yPerc * ((PWM_RANGE - PWM_5_PERC * 2) / 2)) + PWM_MIN + PWM_5_PERC * 2;
@@ -757,9 +884,9 @@ void *scheduler()
                 {
                     io->pwm->DAT1 = 0;
                     io->pwm->DAT2 = 0;
-                    GPIO_CLR(io->gpio, 5); //set to backward
+                    GPIO_CLR(io->gpio, 5); // set to backward
                     GPIO_SET(io->gpio, 6);
-                    GPIO_CLR(io->gpio, 22); //set to backward
+                    GPIO_CLR(io->gpio, 22); // set to backward
                     GPIO_SET(io->gpio, 23);
 
                     rSpd = PWM_MIN + PWM_5_PERC * 2;
@@ -801,14 +928,16 @@ void *scheduler()
         stopLoop = clock() / CLOCKS_PER_MIRCO;
         remainingTime = THREAD_PROCESS_TIME_uS - stopLoop + startLoop;
         if (remainingTime > 0)
-            usleep(remainingTime); //sleep for remaining portion of 10ms
+            usleep(remainingTime); // sleep for remaining portion of 10ms
     }
     pthread_exit(0);
 }
 
-//controls left motors
+// controls left motors
 void *leftCtrl()
 {
+    printf("leftctrl ID= %d\n", pthread_self()); // get current thread id FIXME
+
     char nextCommand;
     long remainingTime, startLoop, stopLoop;
     while (1)
@@ -834,7 +963,7 @@ void *leftCtrl()
                 state.left_lvl += PWM_5_PERC;
 
             pthread_mutex_lock(&pwmLock);
-            io->pwm->DAT1 = state.left_lvl; //PWMB right
+            io->pwm->DAT1 = state.left_lvl; // PWMB right
             pthread_mutex_unlock(&pwmLock);
         }
         else if (nextCommand == 'j')
@@ -845,7 +974,7 @@ void *leftCtrl()
                 state.left_lvl -= PWM_5_PERC;
 
             pthread_mutex_lock(&pwmLock);
-            io->pwm->DAT1 = state.left_lvl; //PWMB right
+            io->pwm->DAT1 = state.left_lvl; // PWMB right
             pthread_mutex_unlock(&pwmLock);
         }
         else if (nextCommand == 'w')
@@ -853,39 +982,39 @@ void *leftCtrl()
             int tmpLvl = state.left_lvl;
             if (state.leftDirection == 's')
             {
-                GPIO_SET(io->gpio, 22); //set to forward
+                GPIO_SET(io->gpio, 22); // set to forward
                 GPIO_CLR(io->gpio, 23);
 
                 state.left_lvl = tmpLvl / 2;
-                io->pwm->DAT1 = state.left_lvl; //PWMB right
+                io->pwm->DAT1 = state.left_lvl; // PWMB right
                 usleep(100000);                 // sleep .1 s
                 state.left_lvl = tmpLvl;
-                io->pwm->DAT1 = state.left_lvl; //PWMB right
+                io->pwm->DAT1 = state.left_lvl; // PWMB right
             }
             if (state.leftDirection == 'x')
             {
                 state.left_lvl = state.left_lvl / 2;
                 io->pwm->DAT1 = state.left_lvl;
-                ;               //PWMB right
+                ;               // PWMB right
                 usleep(100000); // sleep .1 s
 
-                state.left_lvl = 0;             //stop
-                io->pwm->DAT1 = state.left_lvl; //PWMB right
-                usleep(100000);                 //sleep .1s
+                state.left_lvl = 0;             // stop
+                io->pwm->DAT1 = state.left_lvl; // PWMB right
+                usleep(100000);                 // sleep .1s
 
-                GPIO_SET(io->gpio, 22); //set to forward
+                GPIO_SET(io->gpio, 22); // set to forward
                 GPIO_CLR(io->gpio, 23);
 
                 state.left_lvl = tmpLvl / 2;    // half speed
-                io->pwm->DAT1 = state.left_lvl; //PWMB right
-                usleep(100000);                 //sleep .1s
+                io->pwm->DAT1 = state.left_lvl; // PWMB right
+                usleep(100000);                 // sleep .1s
                 state.left_lvl = tmpLvl;        // half speed
                 io->pwm->DAT1 = state.left_lvl;
-                ; //PWMB right
+                ; // PWMB right
             }
             else
             {
-                GPIO_SET(io->gpio, 22); //set to forward
+                GPIO_SET(io->gpio, 22); // set to forward
                 GPIO_CLR(io->gpio, 23);
             }
             state.leftDirection = 'w';
@@ -895,39 +1024,39 @@ void *leftCtrl()
             int tmpLvl = state.left_lvl;
             if (state.leftDirection == 's')
             {
-                GPIO_SET(io->gpio, 23); //set to reverse
+                GPIO_SET(io->gpio, 23); // set to reverse
                 GPIO_CLR(io->gpio, 22);
 
                 state.left_lvl = state.left_lvl / 2;
                 io->pwm->DAT1 = state.left_lvl;
-                ;               //PWMB right
+                ;               // PWMB right
                 usleep(100000); // sleep .1 s
                 state.left_lvl = tmpLvl;
                 io->pwm->DAT1 = state.left_lvl;
-                ; //PWMB right
+                ; // PWMB right
             }
             if (state.leftDirection == 'w')
             {
                 state.left_lvl = state.left_lvl / 2;
-                io->pwm->DAT1 = state.left_lvl; //PWMB right
+                io->pwm->DAT1 = state.left_lvl; // PWMB right
                 usleep(100000);                 // sleep .1 s
 
-                state.left_lvl = 0;             //stop
-                io->pwm->DAT1 = state.left_lvl; //PWMB right
-                usleep(100000);                 //sleep .1s
+                state.left_lvl = 0;             // stop
+                io->pwm->DAT1 = state.left_lvl; // PWMB right
+                usleep(100000);                 // sleep .1s
 
-                GPIO_SET(io->gpio, 23); //set to reverse
+                GPIO_SET(io->gpio, 23); // set to reverse
                 GPIO_CLR(io->gpio, 22);
 
                 state.left_lvl = tmpLvl / 2;    // half speed
-                io->pwm->DAT1 = state.left_lvl; //PWMB right
-                usleep(100000);                 //sleep .1s
+                io->pwm->DAT1 = state.left_lvl; // PWMB right
+                usleep(100000);                 // sleep .1s
                 state.left_lvl = tmpLvl;        // half speed
-                io->pwm->DAT1 = state.left_lvl; //PWMB right
+                io->pwm->DAT1 = state.left_lvl; // PWMB right
             }
             else
             {
-                GPIO_SET(io->gpio, 23); //set to reverse
+                GPIO_SET(io->gpio, 23); // set to reverse
                 GPIO_CLR(io->gpio, 22);
             }
             state.leftDirection = 'x';
@@ -935,12 +1064,12 @@ void *leftCtrl()
         else if (nextCommand == 's')
         {
             state.left_lvl = state.left_lvl / 2;
-            io->pwm->DAT1 = state.left_lvl; //PWMB right
+            io->pwm->DAT1 = state.left_lvl; // PWMB right
             usleep(100000);                 // sleep .1 s
             state.left_lvl = 0;             // stop
-            io->pwm->DAT1 = state.left_lvl; //PWMB right
+            io->pwm->DAT1 = state.left_lvl; // PWMB right
 
-            GPIO_CLR(io->gpio, 23); //set to stop
+            GPIO_CLR(io->gpio, 23); // set to stop
             GPIO_CLR(io->gpio, 22);
             state.leftDirection = 's';
         }
@@ -948,7 +1077,7 @@ void *leftCtrl()
         {
             if (state.leftDirection == 's')
             {
-                GPIO_SET(io->gpio, 22); //set to forward
+                GPIO_SET(io->gpio, 22); // set to forward
                 GPIO_CLR(io->gpio, 23);
             }
             int tmpLvl = state.left_lvl;
@@ -961,18 +1090,16 @@ void *leftCtrl()
 
             if (state.leftDirection == 's')
             {
-                GPIO_CLR(io->gpio, 22); //set to stop
+                GPIO_CLR(io->gpio, 22); // set to stop
                 GPIO_CLR(io->gpio, 23);
             }
-            if (state.c_count > 0)
-                state.c_count -= 1;
         }
         else if (nextCommand == 'z')
         {
             int turn_time = Z_C_TURN_TIME;
             if (state.leftDirection == 's')
             {
-                GPIO_SET(io->gpio, 22); //set to forward
+                GPIO_SET(io->gpio, 22); // set to forward
                 GPIO_CLR(io->gpio, 23);
             }
             int tmpLvl = state.left_lvl;
@@ -985,28 +1112,26 @@ void *leftCtrl()
 
             if (state.leftDirection == 's')
             {
-                GPIO_CLR(io->gpio, 22); //set to stop
+                GPIO_CLR(io->gpio, 22); // set to stop
                 GPIO_CLR(io->gpio, 23);
             }
-            if (state.z_count > 0)
-                state.z_count -= 1;
         }
         else if (nextCommand == 'd')
         {
             if (state.leftDirection == 's')
             {
-                GPIO_SET(io->gpio, 22); //set to forward
+                GPIO_SET(io->gpio, 22); // set to forward
                 GPIO_CLR(io->gpio, 23);
             }
             int tmpLvl = state.left_lvl;
             state.left_lvl = PWM_MIN + 3 * PWM_5_PERC;
-            io->pwm->DAT1 = state.left_lvl; //PWMB right
+            io->pwm->DAT1 = state.left_lvl; // PWMB right
             usleep(TURN_TIME);
             state.left_lvl = tmpLvl;
-            io->pwm->DAT1 = state.left_lvl; //PWMB right
+            io->pwm->DAT1 = state.left_lvl; // PWMB right
             if (state.leftDirection == 's')
             {
-                GPIO_CLR(io->gpio, 22); //set to stop
+                GPIO_CLR(io->gpio, 22); // set to stop
                 GPIO_CLR(io->gpio, 23);
             }
         }
@@ -1014,18 +1139,18 @@ void *leftCtrl()
         {
             if (state.leftDirection == 's')
             {
-                GPIO_SET(io->gpio, 22); //set to forward
+                GPIO_SET(io->gpio, 22); // set to forward
                 GPIO_CLR(io->gpio, 23);
             }
             int tmpLvl = state.left_lvl;
             state.left_lvl = RIGHT_MAX;
-            io->pwm->DAT1 = state.left_lvl; //PWMB right
+            io->pwm->DAT1 = state.left_lvl; // PWMB right
             usleep(TURN_TIME);
             state.left_lvl = tmpLvl;
-            io->pwm->DAT1 = state.left_lvl; //PWMB right
+            io->pwm->DAT1 = state.left_lvl; // PWMB right
             if (state.leftDirection == 's')
             {
-                GPIO_CLR(io->gpio, 22); //set to stop
+                GPIO_CLR(io->gpio, 22); // set to stop
                 GPIO_CLR(io->gpio, 23);
             }
         }
@@ -1033,7 +1158,7 @@ void *leftCtrl()
         stopLoop = clock() / CLOCKS_PER_MIRCO;
         remainingTime = THREAD_PROCESS_TIME_uS - stopLoop + startLoop;
         if (remainingTime > 0)
-            usleep(remainingTime); //sleep for remaining portion of 10ms
+            usleep(remainingTime); // sleep for remaining portion of 10ms
     }
 
     pthread_exit(0);
@@ -1041,6 +1166,8 @@ void *leftCtrl()
 
 void *rightCtrl()
 {
+    printf("rightCtrl ID= %d\n", pthread_self()); // get current thread id FIXME
+
     char nextCommand;
     long remainingTime, startLoop, stopLoop;
     while (1)
@@ -1066,7 +1193,7 @@ void *rightCtrl()
                 state.right_lvl += PWM_5_PERC;
 
             pthread_mutex_lock(&pwmLock);
-            io->pwm->DAT2 = leftLookup[state.right_lvl]; //PWMB left
+            io->pwm->DAT2 = leftLookup[state.right_lvl]; // PWMB left
             pthread_mutex_unlock(&pwmLock);
         }
         else if (nextCommand == 'j')
@@ -1077,7 +1204,7 @@ void *rightCtrl()
                 state.right_lvl -= PWM_5_PERC;
 
             pthread_mutex_lock(&pwmLock);
-            io->pwm->DAT2 = leftLookup[state.right_lvl]; //PWMB left
+            io->pwm->DAT2 = leftLookup[state.right_lvl]; // PWMB left
             pthread_mutex_unlock(&pwmLock);
         }
         else if (nextCommand == 'w')
@@ -1085,39 +1212,39 @@ void *rightCtrl()
             int tmpLvl = state.right_lvl;
             if (state.rightDirection == 's')
             {
-                GPIO_SET(io->gpio, 5); //set to forward
+                GPIO_SET(io->gpio, 5); // set to forward
                 GPIO_CLR(io->gpio, 6);
 
                 state.right_lvl = tmpLvl / 2;
-                io->pwm->DAT2 = state.right_lvl; //PWMB left
+                io->pwm->DAT2 = state.right_lvl; // PWMB left
                 usleep(100000);                  // sleep .1 s
                 state.right_lvl = tmpLvl;
-                io->pwm->DAT2 = state.right_lvl; //PWMB left
+                io->pwm->DAT2 = state.right_lvl; // PWMB left
             }
             if (state.rightDirection == 'x')
             {
                 state.right_lvl = state.right_lvl / 2;
                 io->pwm->DAT2 = state.right_lvl;
-                ;               //PWMB left
+                ;               // PWMB left
                 usleep(100000); // sleep .1 s
 
-                state.right_lvl = 0;             //stop
-                io->pwm->DAT2 = state.right_lvl; //PWMB left
-                usleep(100000);                  //sleep .1s
+                state.right_lvl = 0;             // stop
+                io->pwm->DAT2 = state.right_lvl; // PWMB left
+                usleep(100000);                  // sleep .1s
 
-                GPIO_SET(io->gpio, 5); //set to forward
+                GPIO_SET(io->gpio, 5); // set to forward
                 GPIO_CLR(io->gpio, 6);
 
                 state.right_lvl = tmpLvl / 2;    // half speed
-                io->pwm->DAT2 = state.right_lvl; //PWMB left
-                usleep(100000);                  //sleep .1s
+                io->pwm->DAT2 = state.right_lvl; // PWMB left
+                usleep(100000);                  // sleep .1s
                 state.right_lvl = tmpLvl;        // half speed
                 io->pwm->DAT2 = state.right_lvl;
-                ; //PWMB left
+                ; // PWMB left
             }
             else
             {
-                GPIO_SET(io->gpio, 5); //set to forward
+                GPIO_SET(io->gpio, 5); // set to forward
                 GPIO_CLR(io->gpio, 6);
             }
             state.rightDirection = 'w';
@@ -1127,39 +1254,39 @@ void *rightCtrl()
             int tmpLvl = state.right_lvl;
             if (state.rightDirection == 's')
             {
-                GPIO_SET(io->gpio, 6); //set to reverse
+                GPIO_SET(io->gpio, 6); // set to reverse
                 GPIO_CLR(io->gpio, 5);
 
                 state.right_lvl = state.right_lvl / 2;
                 io->pwm->DAT2 = state.right_lvl;
-                ;               //PWMB left
+                ;               // PWMB left
                 usleep(100000); // sleep .1 s
                 state.right_lvl = tmpLvl;
                 io->pwm->DAT2 = state.right_lvl;
-                ; //PWMB left
+                ; // PWMB left
             }
             if (state.rightDirection == 'w')
             {
                 state.right_lvl = state.right_lvl / 2;
-                io->pwm->DAT2 = state.right_lvl; //PWMB left
+                io->pwm->DAT2 = state.right_lvl; // PWMB left
                 usleep(100000);                  // sleep .1 s
 
-                state.right_lvl = 0;             //stop
-                io->pwm->DAT2 = state.right_lvl; //PWMB left
-                usleep(100000);                  //sleep .1s
+                state.right_lvl = 0;             // stop
+                io->pwm->DAT2 = state.right_lvl; // PWMB left
+                usleep(100000);                  // sleep .1s
 
-                GPIO_SET(io->gpio, 6); //set to reverse
+                GPIO_SET(io->gpio, 6); // set to reverse
                 GPIO_CLR(io->gpio, 5);
 
                 state.right_lvl = tmpLvl / 2;    // half speed
-                io->pwm->DAT2 = state.right_lvl; //PWMB left
-                usleep(100000);                  //sleep .1s
+                io->pwm->DAT2 = state.right_lvl; // PWMB left
+                usleep(100000);                  // sleep .1s
                 state.right_lvl = tmpLvl;        // half speed
-                io->pwm->DAT2 = state.right_lvl; //PWMB left
+                io->pwm->DAT2 = state.right_lvl; // PWMB left
             }
             else
             {
-                GPIO_SET(io->gpio, 6); //set to reverse
+                GPIO_SET(io->gpio, 6); // set to reverse
                 GPIO_CLR(io->gpio, 5);
             }
             state.rightDirection = 'x';
@@ -1167,13 +1294,13 @@ void *rightCtrl()
         else if (nextCommand == 's')
         {
             state.right_lvl = state.right_lvl / 2;
-            io->pwm->DAT2 = state.right_lvl; //PWMB left
+            io->pwm->DAT2 = state.right_lvl; // PWMB left
             usleep(100000);                  // sleep .1 s
             state.right_lvl = 0;             // stop
             io->pwm->DAT2 = state.right_lvl;
-            ; //PWMB left
+            ; // PWMB left
 
-            GPIO_CLR(io->gpio, 6); //set to stop
+            GPIO_CLR(io->gpio, 6); // set to stop
             GPIO_CLR(io->gpio, 5);
             state.rightDirection = 's';
         }
@@ -1181,7 +1308,7 @@ void *rightCtrl()
         {
             if (state.rightDirection == 's')
             {
-                GPIO_SET(io->gpio, 5); //set to forward
+                GPIO_SET(io->gpio, 5); // set to forward
                 GPIO_CLR(io->gpio, 6);
             }
             int tmpLvl = state.right_lvl;
@@ -1192,11 +1319,9 @@ void *rightCtrl()
 
             if (state.rightDirection == 's')
             {
-                GPIO_CLR(io->gpio, 5); //set to stop
+                GPIO_CLR(io->gpio, 5); // set to stop
                 GPIO_CLR(io->gpio, 6);
             }
-            if (state.z_count > 0)
-                state.z_count -= 1;
         }
         else if (nextCommand == 'c')
         {
@@ -1204,7 +1329,7 @@ void *rightCtrl()
 
             if (state.rightDirection == 's')
             {
-                GPIO_SET(io->gpio, 5); //set to forward
+                GPIO_SET(io->gpio, 5); // set to forward
                 GPIO_CLR(io->gpio, 6);
             }
             int tmpLvl = state.right_lvl;
@@ -1216,28 +1341,26 @@ void *rightCtrl()
             setSpdRight(tmpLvl);
             if (state.rightDirection == 's')
             {
-                GPIO_CLR(io->gpio, 5); //set to stop
+                GPIO_CLR(io->gpio, 5); // set to stop
                 GPIO_CLR(io->gpio, 6);
             }
-            if (state.c_count > 0)
-                state.c_count -= 1;
         }
         else if (nextCommand == 'a')
         {
             if (state.rightDirection == 's')
             {
-                GPIO_SET(io->gpio, 5); //set to forward
+                GPIO_SET(io->gpio, 5); // set to forward
                 GPIO_CLR(io->gpio, 6);
             }
             int tmpLvl = state.right_lvl;
             state.right_lvl = leftLookup[PWM_MIN];
-            io->pwm->DAT2 = state.right_lvl; //PWMB right
+            io->pwm->DAT2 = state.right_lvl; // PWMB right
             usleep(TURN_TIME);
             state.right_lvl = tmpLvl;
-            io->pwm->DAT2 = state.right_lvl; //PWMB right
+            io->pwm->DAT2 = state.right_lvl; // PWMB right
             if (state.rightDirection == 's')
             {
-                GPIO_CLR(io->gpio, 5); //set to stop
+                GPIO_CLR(io->gpio, 5); // set to stop
                 GPIO_CLR(io->gpio, 6);
             }
         }
@@ -1245,18 +1368,18 @@ void *rightCtrl()
         {
             if (state.rightDirection == 's')
             {
-                GPIO_SET(io->gpio, 5); //set to forward
+                GPIO_SET(io->gpio, 5); // set to forward
                 GPIO_CLR(io->gpio, 6);
             }
             int tmpLvl = state.right_lvl;
-            state.right_lvl = PWM_MAX;       //adfsaf
-            io->pwm->DAT2 = state.right_lvl; //PWMB right
+            state.right_lvl = PWM_MAX;       // adfsaf
+            io->pwm->DAT2 = state.right_lvl; // PWMB right
             usleep(TURN_TIME);
             state.right_lvl = tmpLvl;
-            io->pwm->DAT2 = state.right_lvl; //PWMB right
+            io->pwm->DAT2 = state.right_lvl; // PWMB right
             if (state.rightDirection == 's')
             {
-                GPIO_CLR(io->gpio, 5); //set to stop
+                GPIO_CLR(io->gpio, 5); // set to stop
                 GPIO_CLR(io->gpio, 6);
             }
         }
@@ -1264,18 +1387,19 @@ void *rightCtrl()
         stopLoop = clock() / CLOCKS_PER_MIRCO;
         remainingTime = THREAD_PROCESS_TIME_uS - stopLoop + startLoop;
         if (remainingTime > 0)
-            usleep(remainingTime); //sleep for remaining portion of 10ms
+            usleep(remainingTime); // sleep for remaining portion of 10ms
     }
     pthread_exit(0);
 }
 
-//thread fuction to check for input
+// thread fuction to check for input
 void *checkInput()
 {
+    printf("Checkinput ID= %d\n", pthread_self()); // get current thread id FIXME
     char tempInput;
     while (1)
     {
-        while ((tempInput = (char)getchar()) == '\0') //while input is not empty do nothing
+        while ((tempInput = (char)getchar()) == '\0') // while input is not empty do nothing
             ;
 
         if (tempInput == 't' || tempInput == 'n' || tempInput == 'p' || tempInput == 's' || tempInput == 'w' || tempInput == 'x' || tempInput == 'i' || tempInput == 'j' || tempInput == 'a' || tempInput == 'd' || tempInput == 'q' || tempInput == 'm' || tempInput == '1' || tempInput == '2' || tempInput == '0' || tempInput == 'z' || tempInput == 'c')
@@ -1287,20 +1411,16 @@ void *checkInput()
             }
             if (tempInput == 'm')
             {
-                pthread_mutex_lock(&scheduleLock);
                 queuePush(tempInput, &state.inputQueue);
-                pthread_mutex_unlock(&scheduleLock);
 
-                while ((tempInput = (char)getchar()) == '\0') //while input is not empty do nothing
+                while ((tempInput = (char)getchar()) == '\0') // while input is not empty do nothing
                     ;
             }
 
-            pthread_mutex_lock(&scheduleLock);
             queuePush(tempInput, &state.inputQueue);
-            pthread_mutex_unlock(&scheduleLock);
         }
 
-        printf("\n\033[0;33mhw9>\033[0m "); //newline for reading
+        printf("\n\033[0;33mhw9>\033[0m "); // newline for reading
     }
 
     pthread_exit(0);
@@ -1322,7 +1442,7 @@ void memset64(void *dest, uint64_t value, uintptr_t size)
 int main(void)
 {
     signal(SIGINT, INThandler);
-    signal(SIGALRM, takePic);
+    signal(SIGALRM, alarmHandler);
 
     io = import_registers();
     Camera = raspicam_wrapper_create();
@@ -1352,13 +1472,13 @@ int main(void)
         io->gpio->GPFSEL2.field.FSEL2 = GPFSEL_OUTPUT; // BI1
         io->gpio->GPFSEL2.field.FSEL3 = GPFSEL_OUTPUT; // BI2
 
-        GPIO_CLR(io->gpio, 5); //init to stop
+        GPIO_CLR(io->gpio, 5); // init to stop
         GPIO_CLR(io->gpio, 6);
         GPIO_CLR(io->gpio, 22);
         GPIO_CLR(io->gpio, 23);
 
         printf("hit 'ctl c' or 'q' to quit\n");
-        printf("\033[0;33mhw9>\033[0m "); //newline for reading
+        printf("\033[0;33mhw9>\033[0m "); // newline for reading
 
         static struct termios attr;
         tcgetattr(STDIN_FILENO, &attr);
@@ -1369,12 +1489,12 @@ int main(void)
 
         state.end = false;
         state.stopCollection = true;
+        state.stopPics = true;
         state.left_lvl = 0;
         state.right_lvl = 0;
+        state.alarmCounter = 0;
         state.rightDirection = 's';
         state.leftDirection = 's';
-        state.z_count = 0;
-        state.c_count = 0;
 
         leftLookup[260] = 297;
         leftLookup[297] = 365;
@@ -1426,7 +1546,7 @@ int main(void)
         state.leftQueue.contents = leftContents;
         state.rightQueue.contents = rightContents;
         state.inputQueue.contents = inputContents;
-        state.mode = 1; //FIXME true
+        state.mode = 1; // FIXME true
 
         initDataQueues(&dQueues);
 
@@ -1446,24 +1566,28 @@ int main(void)
         pthread_mutex_init(&takePicLock, NULL);
         pthread_mutex_init(&fileWriteLock, NULL);
         pthread_mutex_init(&writeCountsLock, NULL);
+        pthread_mutex_init(&dataCollectLock, NULL);
         pthread_mutex_init(&newPicLock, NULL);
+        pthread_mutex_init(&alarmLock, NULL);
 
-        pthread_t inputThread, scheduleThread, leftThread, rightThread, dataCThread, dataAThread, procPicThread;
-        pthread_create(&inputThread, &pAttr, &checkInput, NULL);   //create thread for input polling
-        pthread_create(&scheduleThread, &pAttr, &scheduler, NULL); //create thread for menu handling
-        pthread_create(&leftThread, &pAttr, &leftCtrl, NULL);      //create thread for orange blue pwm control
-        pthread_create(&rightThread, &pAttr, &rightCtrl, NULL);    //create thread for orange blue pwm control
-        pthread_create(&procPicThread, &pAttr, &procPic, NULL);    //create thread for processing img
-        // pthread_create(&dataCThread, &pAttr, &dataCollect, NULL);  //create thread data collection
-        // pthread_create(&dataAThread, &pAttr, &dataAnalyze, NULL);  //create thread data collection
+        pthread_t inputThread, scheduleThread, leftThread, rightThread, dataCThread, dataAThread, procPicThread, timedDataThread;
+        pthread_create(&inputThread, &pAttr, &checkInput, NULL);       // create thread for input polling
+        pthread_create(&scheduleThread, &pAttr, &scheduler, NULL);     // create thread for menu handling
+        pthread_create(&leftThread, &pAttr, &leftCtrl, NULL);          // create thread for orange blue pwm control
+        pthread_create(&rightThread, &pAttr, &rightCtrl, NULL);        // create thread for orange blue pwm control
+        pthread_create(&procPicThread, &pAttr, &procPic, NULL);        // create thread for processing img
+        pthread_create(&dataCThread, &pAttr, &dataCollect, NULL);      // create thread data collection
+        pthread_create(&dataAThread, &pAttr, &dataAnalyze, NULL);      // create thread data collection
+        pthread_create(&timedDataThread, &pAttr, &getTimedData, NULL); // create thread data collection
 
         pthread_join(inputThread, NULL);
         pthread_join(scheduleThread, NULL);
         pthread_join(leftThread, NULL);
         pthread_join(rightThread, NULL);
         pthread_join(procPicThread, NULL);
-        // pthread_join(dataCThread, NULL);
-        // pthread_join(dataAThread, NULL);
+        pthread_join(dataCThread, NULL);
+        pthread_join(dataAThread, NULL);
+        // pthread_join(timedDataThread, NULL);
 
         pthread_mutex_destroy(&inputLock);
         pthread_mutex_destroy(&scheduleLock);
@@ -1475,12 +1599,14 @@ int main(void)
         pthread_mutex_destroy(&fileWriteLock);
         pthread_mutex_destroy(&writeCountsLock);
         pthread_mutex_destroy(&newPicLock);
+        pthread_mutex_destroy(&dataCollectLock);
+        pthread_mutex_destroy(&alarmLock);
 
-        //reference
+        // reference
 
-        takePic();              //FIXME
-        processPic(true, true); //FIXME
+        // takePic();              //FIXME
+        // processPic(true, true); //FIXME
 
-        cleanQuit(); //turn off all lights and quit
+        cleanQuit(); // turn off all lights and quit
     }
 }
