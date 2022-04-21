@@ -395,6 +395,32 @@ void alarmHandler()
         pthread_cond_broadcast(&dataCond);
 }
 
+void *getTimedPic()
+{
+
+    while (1)
+    {
+        if (state.end)
+            break;
+
+        pthread_mutex_lock(&alarmLock);
+        pthread_cond_wait(&dataCond, &alarmLock);
+        pthread_mutex_unlock(&alarmLock);
+
+        if (state.alarmCounter > 10)
+        {
+            raspicam_wrapper_grab(Camera);
+
+            state.newPic = 1;
+            state.alarmCounter = 0;
+        }
+        else
+            state.alarmCounter++;
+    }
+
+    pthread_exit(0);
+}
+
 void *getTimedData()
 {
     while (1)
@@ -406,23 +432,9 @@ void *getTimedData()
         pthread_cond_wait(&dataCond, &alarmLock);
         pthread_mutex_unlock(&alarmLock);
 
-        if (state.end)
-            break;
-
         read_accelerometer_gyroscope(&calibration_accelerometer, &calibration_gyroscope, &state.sd, io->bsc);
         state.readCounts += 1;
-
-        if (state.alarmCounter > 10)
-        {
-            raspicam_wrapper_grab(Camera);
-            state.newPic = 1;
-            state.alarmCounter = 0;
-        }
-        else
-            state.alarmCounter++;
     }
-
-    pthread_exit(0);
 }
 
 void dataToPPM(unsigned char *data, char *name, int width, int height, int size) // for testing
@@ -1679,7 +1691,7 @@ int main(void)
         pthread_mutex_init(&newPicLock, NULL);
         pthread_mutex_init(&alarmLock, NULL);
 
-        pthread_t inputThread, scheduleThread, leftThread, rightThread, dataCThread, dataAThread, procPicThread, timedDataThread;
+        pthread_t inputThread, scheduleThread, leftThread, rightThread, dataCThread, dataAThread, procPicThread, timedDataThread, timedPicThread;
         pthread_create(&inputThread, &pAttr, &checkInput, NULL);       // create thread for input polling
         pthread_create(&scheduleThread, &pAttr, &scheduler, NULL);     // create thread for menu handling
         pthread_create(&leftThread, &pAttr, &leftCtrl, NULL);          // create thread for orange blue pwm control
@@ -1688,6 +1700,7 @@ int main(void)
         pthread_create(&dataCThread, &pAttr, &dataCollect, NULL);      // create thread data collection
         pthread_create(&dataAThread, &pAttr, &dataAnalyze, NULL);      // create thread data collection
         pthread_create(&timedDataThread, &pAttr, &getTimedData, NULL); // create thread data collection
+        pthread_create(&timedPicThread, &pAttr, &getTimedPic, NULL);   // create thread data collection
 
         pthread_join(inputThread, NULL);
         pthread_join(scheduleThread, NULL);
@@ -1697,6 +1710,7 @@ int main(void)
         pthread_join(dataCThread, NULL);
         pthread_join(dataAThread, NULL);
         // pthread_join(timedDataThread, NULL);
+        // pthread_join(timedPicThread, NULL);
 
         pthread_mutex_destroy(&inputLock);
         pthread_mutex_destroy(&scheduleLock);
