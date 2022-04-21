@@ -119,8 +119,8 @@ struct publicState
     sig_atomic_t newPic; // is there a new pic to process?
     bool printPic;       // should we print pic?
     unsigned char image[IMG_RED_WIDTH][IMG_RED_HEIGHT];
-    uint16_t xDist;
-    uint16_t yDist;
+    int16_t xDist;
+    int16_t yDist;
     uint8_t alarmCounter;
 } state;
 
@@ -289,6 +289,104 @@ int setSpdRight(int spd)
     }
 
     return time_taken;
+}
+
+void printData(int mode)
+{
+    pthread_mutex_lock(&fileWriteLock);
+    char filename[] = "./hw7m1data.txt";
+    sprintf(filename, "./hw7m%ddata.txt", state.mode);
+    FILE *fp = fopen(filename, "r");
+
+    char *token;
+    char currentline[500];
+    char lastLine[500];
+    float maxMin[12]; // maxAX, maxAY, maxAZ, minAX, minAY, minAZ, maxGX, maxGY, maxGZ, minGX, minGY, minGZ = 0;
+    float rangeAX, intAX, rangeAY, intAY, rangeAZ, intAZ, rangeGX, intGX, rangeGY, intGY, rangeGZ, intGZ, minAX, minAY, minAZ, minGX, minGY, minGZ = 0;
+
+    while (fgets(currentline, sizeof(currentline), fp) != NULL)
+    {
+        strcpy(lastLine, currentline);
+    }
+
+    // get min max data
+    token = strtok(lastLine, ",");
+    for (int i = 0; i < 12; i++)
+    {
+        if (token == NULL)
+            break;
+        maxMin[i] = atof(token);
+        token = strtok(NULL, ",");
+    }
+
+    minAX = maxMin[3];
+    minAY = maxMin[4];
+    minAZ = maxMin[5];
+    minGX = maxMin[9];
+    minGY = maxMin[10];
+    minGZ = maxMin[11];
+
+    rangeAX = maxMin[0] - minAX;
+    rangeAY = maxMin[1] - minAY;
+    rangeAZ = maxMin[2] - minAZ;
+    rangeGX = maxMin[6] - minGX;
+    rangeAX = maxMin[7] - minGY;
+    rangeAX = maxMin[8] - minGZ;
+
+    intAX = rangeAX / 10;
+    intAY = rangeAY / 10;
+    intAZ = rangeAZ / 10;
+    intGX = rangeGX / 10;
+    intGY = rangeGY / 10;
+    intGZ = rangeGZ / 10;
+
+    fseek(fp, 0, SEEK_SET);
+
+    printf("\n");
+
+    float printVal;
+    while (fgets(currentline, sizeof(currentline), fp) != NULL)
+    {
+        token = strtok(currentline, ",");
+        if (token[0] == 'E')
+            break;
+        for (int i = 0; i < 6; i++)
+        {
+            switch (i)
+            {
+            case 0:
+                printf("%d", (int)((atof(token) - minAX) / intAX));
+                break;
+            case 1:
+                printf("%d", (int)((atof(token) - minAY) / intAY));
+                break;
+            case 2:
+                printf("%d", (int)((atof(token) - minAY) / intAZ));
+                break;
+            case 3:
+                printf("%d", (int)((atof(token) - minGX) / intGX));
+                break;
+            case 4:
+                printf("%d", (int)((atof(token) - minGY) / intGY));
+                break;
+            case 5:
+                printf("%d", (int)((atof(token) - minGZ) / intGZ));
+                break;
+            }
+            token = strtok(NULL, ",");
+        }
+        printf("\n");
+    }
+
+    fclose(fp);
+    pthread_mutex_unlock(&fileWriteLock);
+}
+
+void printN()
+{
+    printf("xVel: %f, yVel %f\n", xVelocity, yVelocity); // FIXME
+    printf("xPos: %f, yPos %f\n", xPos, yPos);           // FIXME
+    printf("head: %f\n", heading);                       // FIXME
 }
 
 void alarmHandler()
@@ -495,7 +593,7 @@ void processPic(bool printFull, bool printThresh)
 
 void *dataAnalyze()
 {
-    printf("dataAnalyze ID= %d\n", pthread_self()); // get current thread id FIXME
+    // printf("dataAnalyze ID= %d\n", pthread_self()); // get current thread id FIXME
 
     pthread_mutex_lock(&dataCollectLock);
     pthread_cond_wait(&willCollectData, &dataCollectLock);
@@ -505,8 +603,8 @@ void *dataAnalyze()
     float maxAX = 0, maxAY = 0, maxAZ = 0, minAX = 0, minAY = 0, minAZ = 0, maxGX = 0, maxGY = 0, maxGZ = 0, minGX = 0, minGY = 0, minGZ = 0;
 
     pthread_mutex_lock(&fileWriteLock);
-    char filename[] = "./hw7m1data.txt";
-    sprintf(filename, "./hw7m%ddata.txt", state.mode);
+    char filename[] = "./hw10m1data.txt";
+    sprintf(filename, "./hw10m%ddata.txt", state.mode);
     FILE *fp = fopen(filename, "w+");
 
     while (true)
@@ -607,7 +705,7 @@ void *dataAnalyze()
 
 void *procPic()
 {
-    printf("procPic ID= %d\n", pthread_self()); // get current thread id FIXME
+    // printf("procPic ID= %d\n", pthread_self()); // get current thread id FIXME
 
     long remainingTime = 0, startLoop = 0, stopLoop = 0;
     pthread_mutex_lock(&takePicLock);
@@ -651,7 +749,7 @@ void *procPic()
 void *dataCollect()
 {
 
-    printf("dataCollect ID= %d\n", pthread_self()); // get current thread id FIXME
+    // printf("dataCollect ID= %d\n", pthread_self()); // get current thread id FIXME
     long remainingTime = 0, startLoop = 0, stopLoop = 0;
 
     pthread_mutex_lock(&dataCollectLock);
@@ -709,7 +807,7 @@ void *dataCollect()
 
 void *scheduler()
 {
-    printf("scheduler ID= %d\n", pthread_self()); // get current thread id FIXME
+    // printf("scheduler ID= %d\n", pthread_self()); // get current thread id FIXME
 
     long remainingTime, startLoop, stopLoop, startTurn, stopTurn, m0TimerStart, m0TimerStop = 0;
     uint32_t irRightVal;
@@ -781,7 +879,7 @@ void *scheduler()
                 }
                 else
                 {
-                    printf("\n\033[0;33mhw9>\033[0m ");
+                    printf("\n\033[0;33mhw10>\033[0m ");
                     printf("m%c is not a command", command);
                 }
             }
@@ -805,6 +903,14 @@ void *scheduler()
                 {
                     state.stopCollection = false;
                     pthread_cond_broadcast(&willCollectData);
+                }
+                else if (command == 'p')
+                {
+                    printData(1);
+                }
+                else if (command == 'n')
+                {
+                    printN();
                 }
 
                 pthread_mutex_lock(&leftControlLock);
@@ -837,9 +943,11 @@ void *scheduler()
             }
             else if (command == 'p')
             {
-                pthread_mutex_lock(&printLock);
-                state.printPic = true;
-                pthread_mutex_unlock(&printLock);
+                printData(2);
+            }
+            else if (command == 'n')
+            {
+                printN();
             }
             else if (command == 'w' || m2IsDriving)
             { // FIXME
@@ -900,28 +1008,28 @@ void *scheduler()
                     io->pwm->DAT2 = 0;
                 }
 
-                // if (lSpd > 297)
-                // {
-                //     // printf("xPerc: %f, yPerc: %f\n", xPerc, yPerc); //FIXME
+                if (lSpd > 297)
+                {
+                    // printf("xPerc: %f, yPerc: %f\n", xPerc, yPerc); //FIXME
 
-                //     // io->pwm->DAT1 = lSpd;
-                //     io->pwm->DAT1 = leftLookup[lSpd];
-                //     // printf("lspd: %d, lookup: %d", lSpd, leftLookup[lSpd]); //FIXME
+                    // io->pwm->DAT1 = lSpd;
+                    io->pwm->DAT1 = leftLookup[lSpd];
+                    // printf("lspd: %d, lookup: %d", lSpd, leftLookup[lSpd]); //FIXME
 
-                // } //PWMA left
-                // else
-                //     io->pwm->DAT1 = 0; //PWMA left
+                } // PWMA left
+                else
+                    io->pwm->DAT1 = 0; // PWMA left
 
-                // if (rSpd > 297)
-                // {
-                //     // printf("xPerc: %f, yPerc: %f\n", xPerc, yPerc); //FIXME
+                if (rSpd > 297)
+                {
+                    // printf("xPerc: %f, yPerc: %f\n", xPerc, yPerc); //FIXME
 
-                //     io->pwm->DAT2 = rSpd;
-                // } //PWMB right
-                // else
-                //     io->pwm->DAT2 = 0; //PWMA left
+                    io->pwm->DAT2 = rSpd;
+                } // PWMB right
+                else
+                    io->pwm->DAT2 = 0; // PWMA left
 
-                // printf("xPerc: %f, yPerc: %f\n", xPerc, yPerc); //FIXME
+                // printf("xPerc: %f, yPerc: %f\n", xPerc, yPerc); // FIXME
             }
         }
 
@@ -936,7 +1044,7 @@ void *scheduler()
 // controls left motors
 void *leftCtrl()
 {
-    printf("leftctrl ID= %d\n", pthread_self()); // get current thread id FIXME
+    // printf("leftctrl ID= %d\n", pthread_self()); // get current thread id FIXME
 
     char nextCommand;
     long remainingTime, startLoop, stopLoop;
@@ -1166,7 +1274,7 @@ void *leftCtrl()
 
 void *rightCtrl()
 {
-    printf("rightCtrl ID= %d\n", pthread_self()); // get current thread id FIXME
+    // printf("rightCtrl ID= %d\n", pthread_self()); // get current thread id FIXME
 
     char nextCommand;
     long remainingTime, startLoop, stopLoop;
@@ -1395,7 +1503,7 @@ void *rightCtrl()
 // thread fuction to check for input
 void *checkInput()
 {
-    printf("Checkinput ID= %d\n", pthread_self()); // get current thread id FIXME
+    // printf("Checkinput ID= %d\n", pthread_self()); // get current thread id FIXME
     char tempInput;
     while (1)
     {
@@ -1420,7 +1528,7 @@ void *checkInput()
             queuePush(tempInput, &state.inputQueue);
         }
 
-        printf("\n\033[0;33mhw9>\033[0m "); // newline for reading
+        printf("\n\033[0;33mhw10>\033[0m "); // newline for reading
     }
 
     pthread_exit(0);
@@ -1446,6 +1554,7 @@ int main(void)
 
     io = import_registers();
     Camera = raspicam_wrapper_create();
+    init_gyro(io, &calibration_accelerometer, &calibration_gyroscope, &calibration_magnetometer);
 
     if (raspicam_wrapper_open(Camera))
     {
@@ -1478,7 +1587,7 @@ int main(void)
         GPIO_CLR(io->gpio, 23);
 
         printf("hit 'ctl c' or 'q' to quit\n");
-        printf("\033[0;33mhw9>\033[0m "); // newline for reading
+        printf("\033[0;33mhw10>\033[0m "); // newline for reading
 
         static struct termios attr;
         tcgetattr(STDIN_FILENO, &attr);
@@ -1601,11 +1710,6 @@ int main(void)
         pthread_mutex_destroy(&newPicLock);
         pthread_mutex_destroy(&dataCollectLock);
         pthread_mutex_destroy(&alarmLock);
-
-        // reference
-
-        // takePic();              //FIXME
-        // processPic(true, true); //FIXME
 
         cleanQuit(); // turn off all lights and quit
     }
