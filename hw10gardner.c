@@ -1008,6 +1008,10 @@ void *scheduler()
                 {
                     printN();
                 }
+                else if (command == 'r')
+                {
+                    isReplaying = true;
+                }
 
                 pthread_mutex_lock(&leftControlLock);
                 queuePush(command, &state.leftQueue);
@@ -1016,6 +1020,78 @@ void *scheduler()
                 pthread_mutex_lock(&rightControlLock);
                 queuePush(command, &state.rightQueue);
                 pthread_mutex_unlock(&rightControlLock);
+            }
+        }
+
+        if (state.mode == 1)
+        {
+            if (isReplaying && !m1IsDriving)
+            {
+                if (!isReplaying)
+                {
+                    isReplaying = true;
+
+                    GPIO_SET(io->gpio, 5); // set to forward
+                    GPIO_CLR(io->gpio, 6);
+                    GPIO_SET(io->gpio, 22); // set to forward
+                    GPIO_CLR(io->gpio, 23);
+
+                    io->pwm->DAT1 = 0;
+                    io->pwm->DAT2 = 0;
+                }
+
+                if (state.rightHist.head - 1 >= -1)
+                {
+
+                    int lSpd = stackPop(&state.leftHist);
+                    int rSpd = stackPop(&state.rightHist);
+
+                    if (lSpd < 0 || rSpd < 0)
+                    {
+                        io->pwm->DAT1 = 0;
+                        io->pwm->DAT2 = 0;
+
+                        GPIO_SET(io->gpio, 5); // set to forward
+                        GPIO_CLR(io->gpio, 6);
+                        GPIO_SET(io->gpio, 22); // set to forward
+                        GPIO_CLR(io->gpio, 23);
+
+                        lSpd = -1 * lSpd;
+                        rSpd = -1 * rSpd;
+                    }
+                    else
+                    {
+                        io->pwm->DAT1 = 0;
+                        io->pwm->DAT2 = 0;
+
+                        GPIO_CLR(io->gpio, 5); // set to backward
+                        GPIO_SET(io->gpio, 6);
+                        GPIO_CLR(io->gpio, 22); // set to backward
+                        GPIO_SET(io->gpio, 23);
+
+                        // int tmp = rSpd;
+                        // rSpd = lSpd;
+                        // lSpd = tmp;
+                    }
+
+                    if (lSpd > 0 && lSpd < 1000)
+                        io->pwm->DAT1 = leftLookup[(int)lSpd];
+                    else
+                        io->pwm->DAT1 = 0;
+
+                    if (rSpd > 0 && rSpd < 1000)
+                        io->pwm->DAT2 = (int)rSpd;
+                    else
+                        io->pwm->DAT2 = 0;
+
+                    printf("%d\n", lSpd);
+                }
+                else
+                {
+                    isReplaying = false;
+                    io->pwm->DAT1 = 0;
+                    io->pwm->DAT2 = 0;
+                }
             }
         }
 
