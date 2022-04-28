@@ -76,6 +76,7 @@ const int TURN_LOW = PWM_MIN + 2 * PWM_5_PERC;
 const int RAMP_TIME = 15; // us interval to ramp up / down speed
 const int INSTR_QUEUE_SIZE = 1024;
 const int DATA_QUEUE_SIZE = 10000; // about 1.67 minutes of data
+const int HIST_QUEUE_SIZE = 50000; // about 8.35 minutes of data
 const long TURN_TIME = 300000;
 const long Z_C_TURN_TIME = TURN_TIME / 2;
 const long CHECK_IR_INT = TURN_TIME / 100;
@@ -86,6 +87,7 @@ const long CLOCKS_PER_MIRCO = CLOCKS_PER_MILLI / 1000;
 const float ACC_PRECISION = 0.001;
 
 uint64_t leftLookup[1000];
+unsigned char *rawImg;
 
 float xVelocity = 0, yVelocity = 0, heading = 0; // m/s
 float xPos = 0, yPos = 0;                        // m
@@ -100,6 +102,13 @@ pthread_mutex_t alarmLock1, alarmLock2, inputLock, dataCollectLock, leftControlL
 pthread_cond_t willTakePic = PTHREAD_COND_INITIALIZER;
 pthread_cond_t willCollectData = PTHREAD_COND_INITIALIZER;
 pthread_cond_t dataCond = PTHREAD_COND_INITIALIZER;
+
+struct intStack
+{
+    int32_t head;
+    int32_t maxSize;
+    int *contents;
+};
 
 struct publicState
 {
@@ -122,6 +131,8 @@ struct publicState
     int16_t xDist;
     int16_t yDist;
     uint8_t alarmCounter;
+    struct intStack rightHist;
+    struct intStack leftHist;
 } state;
 
 struct dataQueue
@@ -152,29 +163,87 @@ void initDataQueues(struct dataQueue *dq)
     initFQueue(&(dq->GYRO_Z), DATA_QUEUE_SIZE);
     initFQueue(&(dq->TIME), DATA_QUEUE_SIZE);
 
-    float AX[DATA_QUEUE_SIZE];
-    float AY[DATA_QUEUE_SIZE];
-    float AZ[DATA_QUEUE_SIZE];
-    float GX[DATA_QUEUE_SIZE];
-    float GY[DATA_QUEUE_SIZE];
-    float GZ[DATA_QUEUE_SIZE];
-    float RT[DATA_QUEUE_SIZE];
+    // float AX[DATA_QUEUE_SIZE];
+    // float AY[DATA_QUEUE_SIZE];
+    // float AZ[DATA_QUEUE_SIZE];
+    // float GX[DATA_QUEUE_SIZE];
+    // float GY[DATA_QUEUE_SIZE];
+    // float GZ[DATA_QUEUE_SIZE];
+    // float RT[DATA_QUEUE_SIZE];
+    // float RH[DATA_QUEUE_SIZE];
+    // float LH[DATA_QUEUE_SIZE];
 
-    memset(AX, 0, DATA_QUEUE_SIZE * sizeof(float));
-    memset(AY, 0, DATA_QUEUE_SIZE * sizeof(float));
-    memset(AZ, 0, DATA_QUEUE_SIZE * sizeof(float));
-    memset(GX, 0, DATA_QUEUE_SIZE * sizeof(float));
-    memset(GY, 0, DATA_QUEUE_SIZE * sizeof(float));
-    memset(GZ, 0, DATA_QUEUE_SIZE * sizeof(float));
-    memset(RT, 0, DATA_QUEUE_SIZE * sizeof(float));
+    // memset(AX, 0, DATA_QUEUE_SIZE * sizeof(float));
+    // memset(AY, 0, DATA_QUEUE_SIZE * sizeof(float));
+    // memset(AZ, 0, DATA_QUEUE_SIZE * sizeof(float));
+    // memset(GX, 0, DATA_QUEUE_SIZE * sizeof(float));
+    // memset(GY, 0, DATA_QUEUE_SIZE * sizeof(float));
+    // memset(GZ, 0, DATA_QUEUE_SIZE * sizeof(float));
+    // memset(RT, 0, DATA_QUEUE_SIZE * sizeof(float));
+    // memset(RH, 0, DATA_QUEUE_SIZE * sizeof(float));
+    // memset(LH, 0, DATA_QUEUE_SIZE * sizeof(float));
 
-    dq->ACCEL_X.contents = AX;
-    dq->ACCEL_Y.contents = AY;
-    dq->ACCEL_Z.contents = AZ;
-    dq->GYRO_X.contents = GX;
-    dq->GYRO_Y.contents = GY;
-    dq->GYRO_Z.contents = GZ;
-    dq->TIME.contents = RT;
+    dq->ACCEL_X.contents = calloc(0, DATA_QUEUE_SIZE * sizeof(float));
+    dq->ACCEL_Y.contents = calloc(0, DATA_QUEUE_SIZE * sizeof(float));
+    dq->ACCEL_Z.contents = calloc(0, DATA_QUEUE_SIZE * sizeof(float));
+    dq->GYRO_X.contents = calloc(0, DATA_QUEUE_SIZE * sizeof(float));
+    dq->GYRO_Y.contents = calloc(0, DATA_QUEUE_SIZE * sizeof(float));
+    dq->GYRO_Z.contents = calloc(0, DATA_QUEUE_SIZE * sizeof(float));
+    dq->TIME.contents = calloc(0, DATA_QUEUE_SIZE * sizeof(float));
+}
+
+void freeDataQueues(struct dataQueue *dq)
+{
+    free(dq->ACCEL_X.contents);
+    free(dq->ACCEL_Y.contents);
+    free(dq->ACCEL_Z.contents);
+    free(dq->GYRO_X.contents);
+    free(dq->GYRO_Y.contents);
+    free(dq->GYRO_Z.contents);
+    free(dq->TIME.contents);
+}
+
+void initStack(struct intStack *s, uint32_t maxSize)
+{
+    s->head = -1;
+    s->maxSize = maxSize;
+    s->contents = calloc(0, maxSize * sizeof(int));
+}
+
+void clearStack(struct intStack *s)
+{
+    s->head = -1;
+}
+
+void destroyStack(struct intStack *s)
+{
+    free(s->contents);
+}
+
+void stackPush(struct intStack *s, int val)
+{
+    if (s->head + 1 <= s->maxSize)
+    {
+        s->contents[s->head + 1] = val;
+        s->head++;
+    }
+    else
+        printf("error: stack exceeds max size");
+}
+
+int stackPop(struct intStack *s)
+{
+    if (s->head - 1 >= -1)
+    {
+        int retVal = s->contents[s->head];
+        s->head--;
+        return retVal;
+    }
+    else
+    {
+        return -1;
+        printf("error: negative indexing stack");
+    }
 }
 
 void clearDataQueues(struct dataQueue *dq)
@@ -187,6 +256,7 @@ void clearDataQueues(struct dataQueue *dq)
     clearFQueue(&(dq->GYRO_Z));
     clearFQueue(&(dq->TIME));
 }
+
 // set all inputs to outputs to turn off lights on quit
 void cleanQuit()
 {
@@ -197,6 +267,10 @@ void cleanQuit()
     io->gpio->GPFSEL2.field.FSEL2 = GPFSEL_INPUT; // GPIO22
     io->gpio->GPFSEL2.field.FSEL3 = GPFSEL_INPUT; // GPIO23
     raspicam_wrapper_destroy(Camera);
+    destroyStack(&state.leftHist);
+    destroyStack(&state.rightHist);
+    free(rawImg);
+    freeDataQueues(&dQueues);
 }
 
 void INThandler(int sig)
@@ -294,8 +368,8 @@ int setSpdRight(int spd)
 void printData(int mode)
 {
     pthread_mutex_lock(&fileWriteLock);
-    char filename[] = "./hw7m1data.txt";
-    sprintf(filename, "./hw7m%ddata.txt", state.mode);
+    char filename[] = "./hw10m1data.txt";
+    sprintf(filename, "./hw10m%ddata.txt", state.mode);
     FILE *fp = fopen(filename, "r");
 
     char *token;
@@ -330,8 +404,8 @@ void printData(int mode)
     rangeAY = maxMin[1] - minAY;
     rangeAZ = maxMin[2] - minAZ;
     rangeGX = maxMin[6] - minGX;
-    rangeAX = maxMin[7] - minGY;
-    rangeAX = maxMin[8] - minGZ;
+    rangeGY = maxMin[7] - minGY;
+    rangeGZ = maxMin[8] - minGZ;
 
     intAX = rangeAX / 10;
     intAY = rangeAY / 10;
@@ -361,7 +435,7 @@ void printData(int mode)
                 printf("%d", (int)((atof(token) - minAY) / intAY));
                 break;
             case 2:
-                printf("%d", (int)((atof(token) - minAY) / intAZ));
+                printf("%d", (int)((atof(token) - minAZ) / intAZ));
                 break;
             case 3:
                 printf("%d", (int)((atof(token) - minGX) / intGX));
@@ -370,7 +444,7 @@ void printData(int mode)
                 printf("%d", (int)((atof(token) - minGY) / intGY));
                 break;
             case 5:
-                printf("%d", (int)((atof(token) - minGZ) / intGZ));
+                printf("%d ", (int)((atof(token) - minGZ) / intGZ));
                 break;
             }
             token = strtok(NULL, ",");
@@ -378,15 +452,18 @@ void printData(int mode)
         printf("\n");
     }
 
+    printf("\033[0;33mhw10>\033[0m ");
+
     fclose(fp);
     pthread_mutex_unlock(&fileWriteLock);
 }
 
 void printN()
 {
-    printf("xVel: %f, yVel %f\n", xVelocity, yVelocity); // FIXME
-    printf("xPos: %f, yPos %f\n", xPos, yPos);           // FIXME
-    printf("head: %f\n", heading);                       // FIXME
+    printf("\nxVel: %f, yVel %f\n", xVelocity, yVelocity); // FIXME
+    printf("xPos: %f, yPos %f\n", xPos, yPos);             // FIXME
+    printf("head: %f", heading);                           // FIXME
+    printf("\n\033[0;33mhw10>\033[0m ");
 }
 
 void alarmHandler()
@@ -587,19 +664,17 @@ void makeRedScale(unsigned char *data, unsigned int pixel_count)
 void processPic(bool printFull, bool printThresh)
 {
     size_t image_size = raspicam_wrapper_getImageTypeSize(Camera, RASPICAM_WRAPPER_FORMAT_RGB);
-    unsigned char *data = (unsigned char *)malloc(image_size);
-    raspicam_wrapper_retrieve(Camera, data, RASPICAM_WRAPPER_FORMAT_RGB);
+
+    raspicam_wrapper_retrieve(Camera, rawImg, RASPICAM_WRAPPER_FORMAT_RGB);
     unsigned int pixHeight = raspicam_wrapper_getHeight(Camera);
     unsigned int pixWidth = raspicam_wrapper_getWidth(Camera);
     unsigned int pixel_count = pixHeight * pixWidth;
 
-    makeRedScale(data, pixel_count);
-    sendToArray(data, pixWidth, pixHeight, printThresh);
+    makeRedScale(rawImg, pixel_count);
+    sendToArray(rawImg, pixWidth, pixHeight, printThresh);
 
     if (printFull)
-        dataToPPM(data, "test1.ppm", pixWidth, pixHeight, image_size); // FIXME
-
-    free(data);
+        dataToPPM(rawImg, "test1.ppm", pixWidth, pixHeight, image_size); // FIXME
 }
 
 void *dataAnalyze()
@@ -652,7 +727,7 @@ void *dataAnalyze()
                 xPos = 0, yPos = 0;           // m
                 heading = 0;
 
-                sprintf(filename, "./hw7m%ddata.txt", state.mode);
+                sprintf(filename, "./hw10m%ddata.txt", state.mode);
                 pthread_mutex_lock(&fileWriteLock);
                 fp = fopen(filename, "w+");
             }
@@ -820,10 +895,11 @@ void *scheduler()
 {
     // printf("scheduler ID= %d\n", pthread_self()); // get current thread id FIXME
 
-    long remainingTime, startLoop, stopLoop, startTurn, stopTurn, m0TimerStart, m0TimerStop = 0;
+    long remainingTime = 0, startLoop = 0, stopLoop = 0, startTurn = 0, stopTurn = 0, m0TimerStart = 0, m0TimerStop = 0;
     uint32_t irRightVal;
     uint32_t irLeftVal;
     bool m2IsDriving = false;
+    bool isReplaying = false;
 
     while (1)
     {
@@ -856,6 +932,8 @@ void *scheduler()
                 {
                     // calibrate_accelerometer_and_gyroscope(&calibration_accelerometer, &calibration_gyroscope, io->bsc);
                     m2IsDriving = false;
+                    isReplaying = false;
+
                     state.stopCollection = false;
                     state.mode = 1;
                     pthread_mutex_lock(&rightControlLock);
@@ -871,6 +949,8 @@ void *scheduler()
                 {
                     // calibrate_accelerometer_and_gyroscope(&calibration_accelerometer, &calibration_gyroscope, io->bsc);
                     m2IsDriving = false;
+                    isReplaying = false;
+
                     state.stopCollection = false;
                     state.mode = 2;
 
@@ -939,6 +1019,7 @@ void *scheduler()
             if (command == 's')
             {
                 m2IsDriving = false;
+                isReplaying = false;
                 state.stopCollection = true;
                 state.stopPics = true;
                 state.mode = 2;
@@ -951,6 +1032,65 @@ void *scheduler()
                 clearQueue(&state.leftQueue);
                 queuePush('s', &state.leftQueue);
                 pthread_mutex_unlock(&leftControlLock);
+            }
+            else if ((command == 'r' || isReplaying) && !m2IsDriving)
+            {
+                if (!isReplaying)
+                {
+                    isReplaying = true;
+
+                    GPIO_SET(io->gpio, 5); // set to forward
+                    GPIO_CLR(io->gpio, 6);
+                    GPIO_SET(io->gpio, 22); // set to forward
+                    GPIO_CLR(io->gpio, 23);
+                }
+
+                if (state.rightHist.head - 1 >= -1)
+                {
+
+                    int lSpd = stackPop(&state.leftHist);
+                    int rSpd = stackPop(&state.rightHist);
+
+                    if (lSpd < 0 || rSpd < 0)
+                    {
+                        io->pwm->DAT1 = 0;
+                        io->pwm->DAT2 = 0;
+
+                        GPIO_SET(io->gpio, 5); // set to forward
+                        GPIO_CLR(io->gpio, 6);
+                        GPIO_SET(io->gpio, 22); // set to forward
+                        GPIO_CLR(io->gpio, 23);
+
+                        lSpd = -1 * lSpd;
+                        rSpd = -1 * rSpd;
+                    }
+                    else
+                    {
+                        io->pwm->DAT1 = 0;
+                        io->pwm->DAT2 = 0;
+
+                        GPIO_CLR(io->gpio, 5); // set to backward
+                        GPIO_SET(io->gpio, 6);
+                        GPIO_CLR(io->gpio, 22); // set to backward
+                        GPIO_SET(io->gpio, 23);
+                    }
+
+                    if (lSpd > 0 && lSpd < 1000)
+                        io->pwm->DAT1 = leftLookup[(int)lSpd];
+                    else
+                        io->pwm->DAT1 = 0;
+
+                    if (rSpd > 0 && rSpd < 1000)
+                        io->pwm->DAT2 = (int)rSpd;
+                    else
+                        io->pwm->DAT2 = 0;
+
+                    printf("%d\n", lSpd);
+                }
+                else
+                {
+                    isReplaying = false;
+                }
             }
             else if (command == 'p')
             {
@@ -967,6 +1107,17 @@ void *scheduler()
                 state.stopPics = false;
                 pthread_cond_broadcast(&willTakePic);
                 pthread_cond_broadcast(&willCollectData);
+
+                if (command == 'w')
+                {
+                    clearStack(&state.rightHist);
+                    clearStack(&state.leftHist);
+
+                    GPIO_SET(io->gpio, 5); // set to forward
+                    GPIO_CLR(io->gpio, 6);
+                    GPIO_SET(io->gpio, 22); // set to forward
+                    GPIO_CLR(io->gpio, 23);
+                }
 
                 int rSpd;
                 int lSpd;
@@ -1010,37 +1161,28 @@ void *scheduler()
 
                     rSpd = PWM_MIN + PWM_5_PERC * 2;
                     lSpd = PWM_MIN + PWM_5_PERC * 2;
+
                     io->pwm->DAT1 = leftLookup[lSpd];
                     io->pwm->DAT2 = rSpd;
+
+                    rSpd = (PWM_MIN + PWM_5_PERC * 2) * -1;
+                    lSpd = (PWM_MIN + PWM_5_PERC * 2) * -1;
                 }
                 else
                 {
-                    io->pwm->DAT1 = 0;
-                    io->pwm->DAT2 = 0;
+                    rSpd = 0;
+                    lSpd = 0;
+                    io->pwm->DAT1 = lSpd;
+                    io->pwm->DAT2 = rSpd;
                 }
 
-                if (lSpd > 297)
-                {
-                    // printf("xPerc: %f, yPerc: %f\n", xPerc, yPerc); //FIXME
+                if (lSpd > 1000)
+                    lSpd = 1000;
+                if (rSpd > 1000)
+                    rSpd = 1000;
 
-                    // io->pwm->DAT1 = lSpd;
-                    io->pwm->DAT1 = leftLookup[lSpd];
-                    // printf("lspd: %d, lookup: %d", lSpd, leftLookup[lSpd]); //FIXME
-
-                } // PWMA left
-                else
-                    io->pwm->DAT1 = 0; // PWMA left
-
-                if (rSpd > 297)
-                {
-                    // printf("xPerc: %f, yPerc: %f\n", xPerc, yPerc); //FIXME
-
-                    io->pwm->DAT2 = rSpd;
-                } // PWMB right
-                else
-                    io->pwm->DAT2 = 0; // PWMA left
-
-                // printf("xPerc: %f, yPerc: %f\n", xPerc, yPerc); // FIXME
+                stackPush(&state.rightHist, rSpd);
+                stackPush(&state.leftHist, lSpd);
             }
         }
 
@@ -1521,7 +1663,7 @@ void *checkInput()
         while ((tempInput = (char)getchar()) == '\0') // while input is not empty do nothing
             ;
 
-        if (tempInput == 't' || tempInput == 'n' || tempInput == 'p' || tempInput == 's' || tempInput == 'w' || tempInput == 'x' || tempInput == 'i' || tempInput == 'j' || tempInput == 'a' || tempInput == 'd' || tempInput == 'q' || tempInput == 'm' || tempInput == '1' || tempInput == '2' || tempInput == '0' || tempInput == 'z' || tempInput == 'c')
+        if (tempInput == 'r' || tempInput == 't' || tempInput == 'n' || tempInput == 'p' || tempInput == 's' || tempInput == 'w' || tempInput == 'x' || tempInput == 'i' || tempInput == 'j' || tempInput == 'a' || tempInput == 'd' || tempInput == 'q' || tempInput == 'm' || tempInput == '1' || tempInput == '2' || tempInput == '0' || tempInput == 'z' || tempInput == 'c')
         {
             if (tempInput == 'q')
             {
@@ -1570,7 +1712,12 @@ int main(void)
     if (raspicam_wrapper_open(Camera))
     {
         printf("opening camera");
+
         sleep(1);
+
+        raspicam_wrapper_grab(Camera);
+        size_t image_size = raspicam_wrapper_getImageTypeSize(Camera, RASPICAM_WRAPPER_FORMAT_RGB);
+        rawImg = (unsigned char *)malloc(image_size);
     }
     else
         printf("error opening camera\n");
@@ -1674,6 +1821,9 @@ int main(void)
         initQueue(&state.rightQueue, INSTR_QUEUE_SIZE);
         initQueue(&state.inputQueue, INSTR_QUEUE_SIZE);
 
+        initStack(&state.rightHist, HIST_QUEUE_SIZE);
+        initStack(&state.leftHist, HIST_QUEUE_SIZE);
+
         pthread_attr_t pAttr;
         pthread_attr_init(&pAttr);
 
@@ -1706,7 +1856,7 @@ int main(void)
         pthread_join(scheduleThread, NULL);
         pthread_join(leftThread, NULL);
         pthread_join(rightThread, NULL);
-        pthread_join(procPicThread, NULL);
+        // pthread_join(procPicThread, NULL);
         pthread_join(dataCThread, NULL);
         pthread_join(dataAThread, NULL);
         // pthread_join(timedDataThread, NULL);
