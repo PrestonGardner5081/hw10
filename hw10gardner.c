@@ -98,7 +98,7 @@ struct calibration_data calibration_gyroscope;
 struct calibration_data calibration_magnetometer;
 struct raspicam_wrapper_handle *Camera;
 
-pthread_mutex_t alarmLock1, alarmLock2, inputLock, dataCollectLock, leftControlLock, rightControlLock, scheduleLock, pwmLock, printLock, takePicLock, fileWriteLock, writeCountsLock, newPicLock; // FIXME PRINTLOCK
+pthread_mutex_t alarmLock1, alarmLock2, inputLock, dataCollectLock, leftControlLock, rightControlLock, scheduleLock, pwmLock, printLock, takePicLock, fileWriteLock, initLock, newPicLock; // FIXME PRINTLOCK
 pthread_cond_t willTakePic = PTHREAD_COND_INITIALIZER;
 pthread_cond_t willCollectData = PTHREAD_COND_INITIALIZER;
 pthread_cond_t dataCond = PTHREAD_COND_INITIALIZER;
@@ -207,7 +207,6 @@ void initStack(struct intStack *s, uint32_t maxSize)
 {
     s->head = -1;
     s->maxSize = maxSize;
-    s->contents = calloc(0, maxSize * sizeof(int));
 }
 
 void clearStack(struct intStack *s)
@@ -215,17 +214,12 @@ void clearStack(struct intStack *s)
     s->head = -1;
 }
 
-void destroyStack(struct intStack *s)
-{
-    free(s->contents);
-}
-
 void stackPush(struct intStack *s, int val)
 {
     if (s->head + 1 <= s->maxSize)
     {
-        s->contents[s->head + 1] = val;
         s->head++;
+        s->contents[s->head] = val;
     }
     else
         printf("error: stack exceeds max size");
@@ -267,8 +261,6 @@ void cleanQuit()
     io->gpio->GPFSEL2.field.FSEL2 = GPFSEL_INPUT; // GPIO22
     io->gpio->GPFSEL2.field.FSEL3 = GPFSEL_INPUT; // GPIO23
     raspicam_wrapper_destroy(Camera);
-    destroyStack(&state.leftHist);
-    destroyStack(&state.rightHist);
     free(rawImg);
     freeDataQueues(&dQueues);
 }
@@ -588,8 +580,6 @@ int *threshold(int width, int height) // classify each pixel as over or under th
             else
                 state.image[j][i] = 0;
         }
-        // if (i % 6 == 0) //FIXME
-        // printf("\n");
     }
     if (xCount > 0)
         avg[0] = xAvg / xCount;
@@ -608,7 +598,6 @@ int *threshold(int width, int height) // classify each pixel as over or under th
         state.yDist = avg[1] - IMG_RED_HEIGHT / 2;
     else
         state.yDist = 0;
-    // printf("x: %d, y: %d \n", state.xDist, state.yDist); //FIXME
 }
 
 void sendToArray(unsigned char *data, int width, int height, bool print)
@@ -679,7 +668,6 @@ void processPic(bool printFull, bool printThresh)
 
 void *dataAnalyze()
 {
-    // printf("dataAnalyze ID= %d\n", pthread_self()); // get current thread id FIXME
 
     pthread_mutex_lock(&dataCollectLock);
     pthread_cond_wait(&willCollectData, &dataCollectLock);
@@ -791,7 +779,6 @@ void *dataAnalyze()
 
 void *procPic()
 {
-    // printf("procPic ID= %d\n", pthread_self()); // get current thread id FIXME
 
     long remainingTime = 0, startLoop = 0, stopLoop = 0;
     pthread_mutex_lock(&takePicLock);
@@ -821,7 +808,6 @@ void *procPic()
             processPic(print, print);
             state.printPic = false;
             pthread_mutex_unlock(&printLock);
-            // printf("hey");//FIXME
         }
 
         stopLoop = clock() / CLOCKS_PER_MIRCO;
@@ -834,8 +820,6 @@ void *procPic()
 
 void *dataCollect()
 {
-
-    // printf("dataCollect ID= %d\n", pthread_self()); // get current thread id FIXME
     long remainingTime = 0, startLoop = 0, stopLoop = 0;
 
     pthread_mutex_lock(&dataCollectLock);
@@ -893,12 +877,22 @@ void *dataCollect()
 
 void *scheduler()
 {
-    // printf("scheduler ID= %d\n", pthread_self()); // get current thread id FIXME
+    initStack(&state.rightHist, HIST_QUEUE_SIZE);
+    initStack(&state.leftHist, HIST_QUEUE_SIZE);
+
+    int rHistp[HIST_QUEUE_SIZE];
+    memset(rHistp, 0, sizeof(int) * HIST_QUEUE_SIZE);
+    int lHistp[HIST_QUEUE_SIZE];
+    memset(lHistp, 0, sizeof(int) * HIST_QUEUE_SIZE);
+
+    state.rightHist.contents = rHistp;
+    state.leftHist.contents = lHistp;
 
     long remainingTime = 0, startLoop = 0, stopLoop = 0, startTurn = 0, stopTurn = 0, m0TimerStart = 0, m0TimerStop = 0;
     uint32_t irRightVal;
     uint32_t irLeftVal;
     bool m2IsDriving = false;
+    bool m1IsDriving = false;
     bool isReplaying = false;
 
     while (1)
@@ -931,6 +925,7 @@ void *scheduler()
                 if (command == '1')
                 {
                     // calibrate_accelerometer_and_gyroscope(&calibration_accelerometer, &calibration_gyroscope, io->bsc);
+                    m1IsDriving = false;
                     m2IsDriving = false;
                     isReplaying = false;
 
@@ -948,6 +943,7 @@ void *scheduler()
                 else if (command == '2')
                 {
                     // calibrate_accelerometer_and_gyroscope(&calibration_accelerometer, &calibration_gyroscope, io->bsc);
+                    m1IsDriving = false;
                     m2IsDriving = false;
                     isReplaying = false;
 
@@ -979,6 +975,10 @@ void *scheduler()
             {
                 if (command == 's')
                 {
+                    m1IsDriving = false;
+                    m2IsDriving = false;
+                    isReplaying = false;
+
                     state.stopCollection = true;
                     state.mode = 1;
                     pthread_mutex_lock(&rightControlLock);
@@ -992,6 +992,11 @@ void *scheduler()
                 }
                 else if (command == 'w' && state.leftDirection != 'w' && state.rightDirection != 'w')
                 {
+                    m1IsDriving = true;
+
+                    clearStack(&state.rightHist);
+                    clearStack(&state.leftHist);
+
                     state.stopCollection = false;
                     pthread_cond_broadcast(&willCollectData);
                 }
@@ -1019,6 +1024,8 @@ void *scheduler()
             if (command == 's')
             {
                 m2IsDriving = false;
+                m1IsDriving = false;
+
                 isReplaying = false;
                 state.stopCollection = true;
                 state.stopPics = true;
@@ -1073,6 +1080,10 @@ void *scheduler()
                         GPIO_SET(io->gpio, 6);
                         GPIO_CLR(io->gpio, 22); // set to backward
                         GPIO_SET(io->gpio, 23);
+
+                        // int tmp = rSpd;
+                        // rSpd = lSpd;
+                        // lSpd = tmp;
                     }
 
                     if (lSpd > 0 && lSpd < 1000)
@@ -1090,6 +1101,8 @@ void *scheduler()
                 else
                 {
                     isReplaying = false;
+                    io->pwm->DAT1 = 0;
+                    io->pwm->DAT2 = 0;
                 }
             }
             else if (command == 'p')
@@ -1101,7 +1114,7 @@ void *scheduler()
                 printN();
             }
             else if (command == 'w' || m2IsDriving)
-            { // FIXME
+            {
                 m2IsDriving = true;
                 state.stopCollection = false;
                 state.stopPics = false;
@@ -1186,6 +1199,15 @@ void *scheduler()
             }
         }
 
+        if (m1IsDriving)
+        {
+            int8_t lScal = state.leftDirection == 'x' ? -1 : 1;
+            int8_t rScal = state.rightDirection == 'x' ? -1 : 1;
+
+            stackPush(&state.leftHist, state.left_lvl * lScal);
+            stackPush(&state.rightHist, state.right_lvl * rScal);
+        }
+
         stopLoop = clock() / CLOCKS_PER_MIRCO;
         remainingTime = THREAD_PROCESS_TIME_uS - stopLoop + startLoop;
         if (remainingTime > 0)
@@ -1197,7 +1219,6 @@ void *scheduler()
 // controls left motors
 void *leftCtrl()
 {
-    // printf("leftctrl ID= %d\n", pthread_self()); // get current thread id FIXME
 
     char nextCommand;
     long remainingTime, startLoop, stopLoop;
@@ -1427,7 +1448,6 @@ void *leftCtrl()
 
 void *rightCtrl()
 {
-    // printf("rightCtrl ID= %d\n", pthread_self()); // get current thread id FIXME
 
     char nextCommand;
     long remainingTime, startLoop, stopLoop;
@@ -1656,7 +1676,6 @@ void *rightCtrl()
 // thread fuction to check for input
 void *checkInput()
 {
-    // printf("Checkinput ID= %d\n", pthread_self()); // get current thread id FIXME
     char tempInput;
     while (1)
     {
@@ -1821,9 +1840,6 @@ int main(void)
         initQueue(&state.rightQueue, INSTR_QUEUE_SIZE);
         initQueue(&state.inputQueue, INSTR_QUEUE_SIZE);
 
-        initStack(&state.rightHist, HIST_QUEUE_SIZE);
-        initStack(&state.leftHist, HIST_QUEUE_SIZE);
-
         pthread_attr_t pAttr;
         pthread_attr_init(&pAttr);
 
@@ -1835,7 +1851,7 @@ int main(void)
         pthread_mutex_init(&printLock, NULL);
         pthread_mutex_init(&takePicLock, NULL);
         pthread_mutex_init(&fileWriteLock, NULL);
-        pthread_mutex_init(&writeCountsLock, NULL);
+        pthread_mutex_init(&initLock, NULL);
         pthread_mutex_init(&dataCollectLock, NULL);
         pthread_mutex_init(&newPicLock, NULL);
         pthread_mutex_init(&alarmLock1, NULL);
@@ -1856,7 +1872,7 @@ int main(void)
         pthread_join(scheduleThread, NULL);
         pthread_join(leftThread, NULL);
         pthread_join(rightThread, NULL);
-        // pthread_join(procPicThread, NULL);
+        pthread_join(procPicThread, NULL);
         pthread_join(dataCThread, NULL);
         pthread_join(dataAThread, NULL);
         // pthread_join(timedDataThread, NULL);
@@ -1870,7 +1886,7 @@ int main(void)
         pthread_mutex_destroy(&pwmLock);
         pthread_mutex_destroy(&takePicLock);
         pthread_mutex_destroy(&fileWriteLock);
-        pthread_mutex_destroy(&writeCountsLock);
+        pthread_mutex_destroy(&initLock);
         pthread_mutex_destroy(&newPicLock);
         pthread_mutex_destroy(&dataCollectLock);
         pthread_mutex_destroy(&alarmLock1);
